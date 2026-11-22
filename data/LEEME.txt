@@ -1,0 +1,3 @@
+Copia aquí pro2.csv y cab.csv (datos de Procaps del curso).
+archive.zip de Kaggle va en la carpeta de arriba (proyecto4/), no aquí.
+Al generar las fases, aquí también se guardan los .rds intermedios y los CSV de libros.

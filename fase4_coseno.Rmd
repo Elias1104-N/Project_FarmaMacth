@@ -1,0 +1,253 @@
+---
+title: "Proyecto 4 · Fase 4: similitud de coseno"
+author: "Equipo · Estadística Industrial 2026-II"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lsa)        # solo como referencia para validar nuestra función: install.packages("lsa")
+theme_set(theme_minimal())
+```
+
+# Datos de partida
+
+Usamos la matriz usuario–producto de la Fase 3: 5.888 compradores × 732 productos, con la
+preferencia **log(1 + cantidad)** y 0 donde no hubo compra.
+
+```{r datos}
+fase3    <- readRDS("data/matriz_usuario_producto.rds")
+X        <- fase3$user_item
+catalogo <- readRDS("data/catalogo.rds")
+nombre   <- function(codigo) catalogo$description[match(codigo, catalogo$Material)]
+
+c(definicion = fase3$definicion, umbral_comunes = fase3$umbral)
+dim(X)
+```
+
+# La similitud de coseno
+
+Para dos vectores $A$ y $B$ (dos columnas de la matriz, es decir, dos productos):
+
+$$\cos(A, B) = \frac{A \cdot B}{\lVert A \rVert \, \lVert B \rVert}
+            = \frac{\sum_i A_i B_i}{\sqrt{\sum_i A_i^2}\,\sqrt{\sum_i B_i^2}}$$
+
+* El **numerador** solo suma sobre los compradores que compraron **los dos** productos
+  (si uno de los dos es 0, el producto $A_i B_i$ es 0).
+* El **denominador** divide por el "tamaño" de cada vector, así que el coseno no depende de
+  cuánto se vende un producto, sino de **quiénes** lo compran y en qué proporción.
+* Como todas las preferencias son $\geq 0$, el coseno queda entre **0** (ningún comprador en
+  común) y **1** (los mismos compradores, en la misma proporción).
+
+## ¿Qué significa geométricamente un coseno de 0,8?
+
+Cada producto es una flecha en un espacio de 5.888 dimensiones, una por comprador. El coseno
+es el coseno del **ángulo** entre las dos flechas:
+
+```{r angulos}
+tibble(coseno = c(1, 0.9, 0.8, 0.5, 0.2, 0)) %>%
+  mutate(angulo_grados = round(acos(coseno) * 180 / pi, 1))
+```
+
+Un coseno de 0,8 corresponde a un ángulo de unos **37°**: las dos flechas apuntan en una
+dirección parecida. En términos de negocio: los dos productos los compran en buena parte los
+**mismos compradores**, y en proporciones parecidas. No dice nada de la cantidad total
+vendida: un producto que vende 10 veces más que otro puede tener coseno 1 con él si se reparte
+entre los compradores de la misma forma.
+
+```{r dibujo, fig.width = 5, fig.height = 4, echo = FALSE}
+ang <- acos(0.8)
+ggplot() +
+  geom_segment(aes(x = 0, y = 0, xend = 1, yend = 0), arrow = arrow(length = unit(0.3, "cm")),
+               color = "steelblue", linewidth = 1) +
+  geom_segment(aes(x = 0, y = 0, xend = cos(ang), yend = sin(ang)),
+               arrow = arrow(length = unit(0.3, "cm")), color = "darkorange", linewidth = 1) +
+  annotate("path", x = 0.3 * cos(seq(0, ang, length.out = 30)),
+           y = 0.3 * sin(seq(0, ang, length.out = 30))) +
+  annotate("text", x = 0.4, y = 0.12, label = "37°") +
+  annotate("text", x = 1.05, y = -0.06, label = "producto A", color = "steelblue") +
+  annotate("text", x = cos(ang) + 0.05, y = sin(ang) + 0.06, label = "producto B",
+           color = "darkorange") +
+  coord_equal(xlim = c(-0.05, 1.2), ylim = c(-0.1, 0.75)) + theme_void() +
+  labs(title = "cos = 0,8 → ángulo de 37°")
+```
+
+# Nuestra función
+
+Partimos de la función del tutorial y la ajustamos a la farmacia:
+
+```{r funcion}
+cos_similarity <- function(A, B) {
+  num <- sum(A * B)                         # producto punto: solo cuentan compradores comunes
+  den <- sqrt(sum(A^2)) * sqrt(sum(B^2))    # producto de las normas
+  if (den == 0) return(NaN)                 # un vector de ceros no tiene dirección: 0/0
+  num / den
+}
+```
+
+**Cambios respecto al tutorial:**
+
+* Se quitó `na.rm = TRUE`: en nuestra matriz "no compró" es 0, no `NA`, así que no hay
+  valores faltantes que ignorar. Si apareciera un `NA` sería un error de construcción y
+  preferimos que se note.
+* El caso de un vector de ceros (un producto sin compradores) devuelve `NaN` de forma
+  explícita, igual que `lsa::cosine`. En la matriz completa no ocurre (todos los productos
+  tienen al menos un comprador), pero sí puede ocurrir en la partición de entrenamiento de la
+  Fase 7, con productos lanzados después de 2020.
+
+# Validación contra `lsa::cosine`
+
+Comparamos nuestra función con `lsa::cosine` en cinco pares elegidos para cubrir casos
+distintos:
+
+```{r pares}
+pares <- tribble(
+  ~caso,                                    ~A,          ~B,
+  "Los dos productos más vendidos",          "300000712", "300000869",
+  "Dos presentaciones de vitamina E",        "300000869", "300000848",
+  "Clotrimazol tópico vs. vaginal",          "300001535", "300001536",
+  "Antimicótico vs. suplemento",             "300000700", "300004184",
+  "Producto popular vs. uno poco vendido",   "300000712", names(which.min(colSums(X > 0)))
+)
+
+validacion <- pares %>%
+  rowwise() %>%
+  mutate(producto_A   = nombre(A),
+         producto_B   = nombre(B),
+         nuestra      = cos_similarity(X[, A], X[, B]),
+         lsa          = as.numeric(lsa::cosine(X[, A], X[, B])),
+         diferencia   = abs(nuestra - lsa),
+         comunes      = sum(X[, A] > 0 & X[, B] > 0)) %>%
+  ungroup()
+
+validacion %>% select(caso, producto_A, producto_B, comunes, nuestra, lsa, diferencia)
+
+stopifnot(all(validacion$diferencia < 1e-12))   # el documento se detiene si no coinciden
+```
+
+Las dos funciones coinciden hasta la precisión numérica del computador (diferencias del orden
+de $10^{-16}$).
+
+Validamos también un par de **compradores** (filas), que es lo que usará el recomendador
+usuario–usuario de la Fase 6:
+
+```{r pares-usuarios}
+u <- rownames(X)[order(rowSums(X > 0), decreasing = TRUE)[1:2]]   # los dos compradores más diversos
+c(nuestra = cos_similarity(X[u[1], ], X[u[2], ]),
+  lsa     = as.numeric(lsa::cosine(X[u[1], ], X[u[2], ])))
+```
+
+# Matriz producto–producto completa
+
+La matriz de 732 × 732 tiene unas 536.000 celdas, así que se puede precalcular una vez y
+consultar después. Calcularla con un doble ciclo llamaría a la función
+`r format(732 * 731 / 2, big.mark = ".", decimal.mark = ",")` veces. Con álgebra matricial es una sola operación:
+`crossprod(X)` da todos los productos punto $A \cdot B$ a la vez, y se divide por el producto
+de las normas.
+
+```{r matriz-coseno}
+cos_matriz <- function(X) {
+  normas <- sqrt(colSums(X^2))                  # norma de cada producto
+  crossprod(X) / outer(normas, normas)          # t(X) %*% X dividido por ||A|| ||B||
+}
+
+tiempo_nuestra <- system.time(S <- cos_matriz(X))
+dim(S)
+```
+
+**Validación de la matriz completa** contra `lsa::cosine(X)`, que calcula la misma matriz
+con un doble ciclo:
+
+```{r validar-matriz}
+tiempo_lsa <- system.time(S_lsa <- lsa::cosine(X))
+
+c(diferencia_maxima = max(abs(S - S_lsa)),
+  segundos_nuestra  = unname(tiempo_nuestra["elapsed"]),
+  segundos_lsa      = unname(tiempo_lsa["elapsed"]))
+
+stopifnot(max(abs(S - S_lsa)) < 1e-12)
+```
+
+Y contra nuestra propia función de pares, en 200 pares al azar:
+
+```{r validar-aleatorio}
+set.seed(2026)
+i <- sample(ncol(X), 200, replace = TRUE)
+j <- sample(ncol(X), 200, replace = TRUE)
+max(abs(mapply(function(a, b) cos_similarity(X[, a], X[, b]), i, j) - S[cbind(i, j)]))
+```
+
+Propiedades que debe cumplir la matriz:
+
+```{r propiedades}
+c(simetrica        = isSymmetric(unname(S)),
+  diagonal_es_1    = all(abs(diag(S) - 1) < 1e-12),
+  entre_0_y_1      = all(S >= 0 & S <= 1 + 1e-12),
+  sin_NaN          = !anyNA(S))
+```
+
+# Umbral de compradores en común
+
+Siguiendo la decisión de la Fase 3, la similitud entre dos productos se pone en 0 si menos de
+`r fase3$umbral` compradores compraron ambos.
+
+```{r umbral}
+B       <- (X > 0) * 1
+comunes <- crossprod(B)                         # compradores en común por par de productos
+
+S_final <- S
+S_final[comunes < fase3$umbral] <- 0
+diag(S_final) <- 0                              # un producto no se recomienda a sí mismo
+
+c(pares_con_similitud_antes   = (sum(S > 0) - ncol(S)) / 2,
+  pares_con_similitud_despues = sum(S_final > 0) / 2)
+```
+
+# ¿Cómo se distribuyen las similitudes?
+
+```{r distribucion, fig.height = 3.5}
+valores <- S_final[upper.tri(S_final)]
+summary(valores[valores > 0])
+
+tibble(similitud = valores[valores > 0]) %>%
+  ggplot(aes(similitud)) + geom_histogram(bins = 50, fill = "steelblue") +
+  labs(x = "Coseno entre pares de productos (sin ceros)", y = "Pares",
+       title = "La mayoría de los pares son poco similares; pocos superan 0,5")
+
+c(pares_sobre_0.5 = sum(valores > 0.5), pares_sobre_0.8 = sum(valores > 0.8))
+```
+
+## Los pares más similares
+
+```{r top-pares}
+idx <- which(upper.tri(S_final), arr.ind = TRUE)
+tibble(A = colnames(S_final)[idx[, 1]], B = colnames(S_final)[idx[, 2]],
+       coseno = S_final[idx], comunes = comunes[idx]) %>%
+  slice_max(coseno, n = 12) %>%
+  mutate(producto_A = nombre(A), producto_B = nombre(B), coseno = round(coseno, 3)) %>%
+  select(producto_A, producto_B, coseno, comunes)
+```
+
+En los pares más similares aparecen tres patrones distintos, que serán el centro del análisis
+de la Fase 5:
+
+1. **Complementos de un mismo tratamiento:** el medidor GlucoQuick con sus tiras, las lancetas
+   con las tiras, el tapabocas con el dispensador. Son buenas recomendaciones: quien compra uno
+   necesita el otro.
+2. **Variantes del mismo producto:** Nutrigel en dos sabores, vitamina E en dos presentaciones,
+   Novamil en dos tamaños. Tienen sentido, pero aportan poco como descubrimiento.
+3. **Popularidad:** el Ginkgo Biloba aparece con coseno alto junto a la vitamina E, la nistatina,
+   etc. No es que sean parte de un mismo tratamiento: son los productos que compran casi todos los
+   compradores. Es el sesgo de popularidad que la Fase 7 medirá contra la línea base.
+
+```{r guardar}
+saveRDS(list(S = S, S_final = S_final, comunes = comunes), "data/similitud_productos.rds")
+```

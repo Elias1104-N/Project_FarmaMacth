@@ -1,0 +1,401 @@
+---
+title: "Proyecto 4 · Fase 3: preferencia implícita y matriz usuario–producto"
+author: "Equipo · Estadística Industrial 2026-II"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+theme_set(theme_minimal())
+```
+
+En los libros, la preferencia era explícita: una calificación de 1 a 10. En la farmacia solo
+sabemos **cuánto compró** cada comprador de cada producto. Esta fase compara cuatro formas
+de convertir esas compras en una "preferencia", construye la matriz usuario–producto, calcula
+su dispersión y elige una definición **con datos**: además del análisis descriptivo, hacemos
+una validación rápida con partición temporal, probando también si conviene exigir un mínimo
+de compradores en común entre dos productos.
+
+# Datos de partida
+
+Partimos de la tabla unida en la Fase 2 (`fase2_datos.Rmd` la guarda en `data/`).
+
+```{r datos}
+datos    <- readRDS("data/datos_unidos.rds")
+catalogo <- readRDS("data/catalogo.rds")
+c(lineas = nrow(datos), compradores = n_distinct(datos$colaborador),
+  productos = n_distinct(datos$Material))
+```
+
+# Cuatro definiciones de preferencia
+
+Para cada par (comprador, producto) calculamos:
+
+| Definición | Fórmula | Qué mide |
+|---|---|---|
+| `suma` | $\sum$ `cantidad` | Volumen total comprado |
+| `facturas` | número de facturas distintas | Cuántas veces volvió a comprarlo (recompra) |
+| `binaria` | 1 si lo compró alguna vez | Solo si lo compró o no |
+| `log` | $\log(1 + \sum$ `cantidad`$)$ | Volumen, pero comprimiendo la cola larga |
+
+```{r preferencias}
+pares <- datos %>%
+  group_by(colaborador, Material) %>%
+  summarise(suma     = sum(cantidad),
+            facturas = n_distinct(invoice),
+            .groups  = "drop") %>%
+  mutate(binaria = 1,
+         log     = log1p(suma))
+
+nrow(pares)   # celdas no vacías de la matriz
+summary(pares[, c("suma", "facturas", "log")])
+```
+
+```{r distribuciones, fig.height = 4}
+pares %>%
+  select(suma, facturas, log) %>%
+  pivot_longer(everything(), names_to = "definicion", values_to = "valor") %>%
+  ggplot(aes(valor)) +
+  geom_histogram(bins = 40, fill = "steelblue") +
+  facet_wrap(~ definicion, scales = "free") +
+  labs(x = NULL, y = "Pares comprador–producto",
+       title = "La suma y las facturas tienen una cola larga; el log la comprime")
+```
+
+La suma va de 1 a `r max(pares$suma)` y el número de facturas de 1 a `r max(pares$facturas)`,
+con la mayoría de los pares en valores muy bajos. Esa cola es el problema: en el coseno, cada
+valor entra **al cuadrado**, así que un par con suma 200 pesa 40.000 veces más que uno con
+suma 1.
+
+# Matriz usuario–producto y dispersión
+
+```{r matriz}
+compradores <- sort(unique(pares$colaborador))
+productos   <- sort(unique(pares$Material))
+
+# construye la matriz densa comprador × producto para una columna de "pares";
+# las celdas sin compra quedan en 0 (no compró), no en NA
+hacer_matriz <- function(pares, columna, filas = compradores, cols = productos) {
+  m <- matrix(0, nrow = length(filas), ncol = length(cols),
+              dimnames = list(filas, cols))
+  m[cbind(match(pares$colaborador, filas), match(pares$Material, cols))] <- pares[[columna]]
+  m
+}
+
+definiciones <- c("suma", "facturas", "binaria", "log")
+matrices <- lapply(setNames(definiciones, definiciones), function(d) hacer_matriz(pares, d))
+
+dim(matrices$suma)
+matrices$suma[1:5, 1:6]
+```
+
+**Dispersión calculada correctamente.** Es la proporción de celdas vacías sobre el total de
+celdas de la matriz **completa** (5.888 × 732), sin recortar filas ni columnas como hacía el
+`top_n(10000)` del tutorial:
+
+```{r dispersion}
+celdas_total <- length(compradores) * length(productos)
+c(celdas_total = celdas_total,
+  celdas_con_compra = nrow(pares),
+  dispersion = 1 - nrow(pares) / celdas_total)
+
+# comprobación con la matriz: misma cifra contando ceros
+mean(matrices$binaria == 0)
+```
+
+Es decir, cerca del `r round(100 * (1 - nrow(pares) / celdas_total), 1)` % de la matriz está
+vacía, frente al 99,98 % de los libros. Ojo con la interpretación: **una celda vacía significa
+"no lo compró", no "no le gusta"**. Puede que no lo necesite, que no lo conozca o que lo compre
+en otra parte.
+
+Con 5.888 × 732 la matriz cabe sin problema en memoria como matriz densa
+(`r format(object.size(matrices$suma), units = "MB")`), así que no hace falta una
+representación dispersa.
+
+# ¿Qué definición evita que un mayorista domine?
+
+Para la similitud ítem–ítem, cada producto es un vector columna. En el coseno, la
+contribución de un comprador a la norma de ese vector es su valor al cuadrado. Medimos,
+para cada producto, **qué parte de la norma al cuadrado aporta su comprador más grande**:
+si es cercana a 1, la similitud de ese producto con los demás la decide prácticamente una
+sola persona.
+
+```{r dominancia}
+cuota_max <- function(m) {
+  apply(m, 2, function(x) max(x^2) / sum(x^2))
+}
+
+dominancia <- sapply(matrices, cuota_max)
+
+tibble(definicion = definiciones,
+       mediana_cuota_comprador_top = apply(dominancia, 2, median),
+       p90 = apply(dominancia, 2, quantile, 0.9),
+       productos_dominados_50pct = colSums(dominancia > 0.5)) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+```{r dominancia-grafico, fig.height = 4}
+as_tibble(dominancia) %>%
+  pivot_longer(everything(), names_to = "definicion", values_to = "cuota") %>%
+  mutate(definicion = factor(definicion, levels = definiciones)) %>%
+  ggplot(aes(definicion, cuota)) +
+  geom_boxplot(fill = "lightsteelblue") +
+  scale_y_log10() +
+  labs(x = NULL, y = "Cuota del mayor comprador (escala log)",
+       title = "Cuánto pesa el comprador más grande de cada producto")
+```
+
+Un ejemplo concreto: el producto más vendido y lo que pesa su mayor comprador con cada definición.
+
+```{r ejemplo-mayorista}
+top_prod <- pares %>% group_by(Material) %>% summarise(u = sum(suma)) %>%
+  slice_max(u, n = 1) %>% pull(Material)
+catalogo %>% filter(Material == top_prod) %>% pull(description)
+
+pares %>% filter(Material == top_prod) %>%
+  slice_max(suma, n = 3) %>% select(colaborador, suma, facturas, log)
+
+round(dominancia[top_prod, ], 4)
+```
+
+**Lectura:** la `suma` es la más expuesta a un comprador mayorista; el número de `facturas`
+lo es menos (repetir compras requiere tiempo, no solo volumen); `log` reduce mucho el peso de
+los grandes volúmenes, y la `binaria` lo elimina por completo, porque cada comprador cuenta
+igual. El costo de la binaria es que descarta la información de intensidad: comprar una vez
+pesa lo mismo que comprar cada mes.
+
+# Validación temporal rápida: ¿qué definición recomienda mejor?
+
+El análisis anterior dice qué definición es **más robusta**, pero no cuál **recomienda mejor**.
+Para decidirlo con datos hacemos una versión rápida de la evaluación de la Fase 7 (que la hará
+completa, con intervalos de confianza y comparación con la línea base):
+
+* **Entrenamiento:** compras hasta el 31/12/2020. **Prueba:** compras de 2021–2022.
+* Para cada comprador presente en ambos periodos, se recomiendan 10 productos con el
+  recomendador ítem–ítem: la puntuación de un producto es la suma de sus similitudes de coseno
+  con los productos que el comprador ya tiene, ponderadas por su preferencia
+  ($\text{puntuación} = X \cdot S$).
+* Se **excluyen** los productos que ya compró en entrenamiento.
+* Acierto: el producto recomendado aparece entre sus compras **nuevas** de 2021–2022.
+
+También probamos un **mínimo de compradores en común**: la similitud entre dos productos se
+pone en 0 si menos de *m* compradores compraron los dos. Con *m* = 1 no hay filtro. La idea
+viene de la Fase 1, donde las similitudes de los libros descansaban en 2 o 3 usuarios.
+
+```{r particion}
+corte <- as.Date("2020-12-31")
+
+pares_periodo <- function(d) {
+  d %>% group_by(colaborador, Material) %>%
+    summarise(suma = sum(cantidad), facturas = n_distinct(invoice), .groups = "drop") %>%
+    mutate(binaria = 1, log = log1p(suma))
+}
+entrena <- pares_periodo(filter(datos, fecha <= corte))
+prueba  <- pares_periodo(filter(datos, fecha >  corte))
+
+usuarios_eval <- intersect(unique(entrena$colaborador), unique(prueba$colaborador))
+
+# compras nuevas en prueba: productos que el comprador no tenía en entrenamiento
+nuevas <- prueba %>%
+  filter(colaborador %in% usuarios_eval) %>%
+  anti_join(entrena, by = c("colaborador", "Material")) %>%
+  select(colaborador, Material)
+
+usuarios_eval <- intersect(usuarios_eval, unique(nuevas$colaborador))  # con algo nuevo que acertar
+
+c(compradores_en_ambos_periodos_con_compras_nuevas = length(usuarios_eval),
+  compras_nuevas = nrow(nuevas))
+```
+
+```{r funciones-eval}
+compr_tr <- sort(unique(entrena$colaborador))
+
+cos_matriz <- function(X) {                    # coseno entre todas las columnas
+  normas <- sqrt(colSums(X^2))
+  S <- crossprod(X) / outer(normas, normas)
+  S[is.nan(S)] <- 0
+  diag(S) <- 0                                 # un producto no se recomienda a sí mismo
+  S
+}
+
+B_tr <- hacer_matriz(entrena, "binaria", filas = compr_tr)
+comunes <- crossprod(B_tr)                     # compradores en común entre cada par de productos
+
+# matriz de aciertos: comprador × producto (1 si es compra nueva en prueba)
+verdad <- matrix(0, length(usuarios_eval), length(productos),
+                 dimnames = list(usuarios_eval, productos))
+verdad[cbind(match(nuevas$colaborador, usuarios_eval), match(nuevas$Material, productos))] <- 1
+
+evaluar <- function(definicion, m, n = 10) {
+  X <- hacer_matriz(entrena, definicion, filas = compr_tr)
+  S <- cos_matriz(X)
+  S[comunes < m] <- 0                          # umbral de compradores en común
+  Xu <- X[usuarios_eval, ]
+  puntaje <- Xu %*% S
+  puntaje[Xu > 0] <- -Inf                      # excluye lo ya comprado
+  top <- t(apply(puntaje, 1, function(p) order(p, decreasing = TRUE)[1:n]))
+  aciertos <- matrix(verdad[cbind(rep(seq_along(usuarios_eval), n), as.vector(top))],
+                     ncol = n)
+  tibble(definicion = definicion, min_comunes = m,
+         hit_rate_10   = mean(rowSums(aciertos) > 0),
+         precision_10  = mean(rowSums(aciertos) / n))
+}
+```
+
+**Verificación de la exclusión:** ningún producto recomendado debe estar entre los que el
+comprador ya tenía en entrenamiento.
+
+```{r verificar-exclusion}
+X <- hacer_matriz(entrena, "binaria", filas = compr_tr)[usuarios_eval, ]
+p <- X %*% cos_matriz(hacer_matriz(entrena, "binaria", filas = compr_tr))
+p[X > 0] <- -Inf
+top <- t(apply(p, 1, function(z) order(z, decreasing = TRUE)[1:10]))
+sum(X[cbind(rep(seq_len(nrow(X)), 10), as.vector(top))] > 0)   # debe ser 0
+```
+
+```{r grilla}
+umbrales <- c(1, 2, 3, 5, 10, 20, 50)
+resultados <- bind_rows(lapply(definiciones, function(d)
+  bind_rows(lapply(umbrales, function(m) evaluar(d, m)))))
+
+resultados %>%
+  mutate(across(c(hit_rate_10, precision_10), ~ round(100 * .x, 2))) %>%
+  pivot_wider(id_cols = min_comunes, names_from = definicion,
+              values_from = hit_rate_10) %>%
+  rename(`mínimo de compradores en común` = min_comunes)
+```
+
+La tabla muestra el **hit rate@10 (%)**: el porcentaje de compradores para los que al menos
+una de las 10 recomendaciones fue una compra nueva en 2021–2022.
+
+```{r grafico-grilla, fig.height = 4}
+resultados %>%
+  pivot_longer(c(hit_rate_10, precision_10), names_to = "metrica", values_to = "valor") %>%
+  mutate(definicion = factor(definicion, levels = definiciones)) %>%
+  ggplot(aes(min_comunes, 100 * valor, color = definicion)) +
+  geom_line(linewidth = 1) + geom_point() +
+  scale_x_log10(breaks = umbrales) +
+  facet_wrap(~ metrica, scales = "free_y") +
+  labs(x = "Mínimo de compradores en común (escala log)", y = "%", color = NULL,
+       title = "Desempeño del ítem–ítem según definición y umbral")
+```
+
+Las diferencias son de décimas de punto. Para saber si alguna es real, calculamos el
+intervalo de confianza del 95 % del hit rate@10 (proporción de `r length(usuarios_eval)`
+compradores, aproximación normal):
+
+```{r intervalos}
+n_eval <- length(usuarios_eval)
+sin_umbral <- resultados %>%
+  filter(min_comunes == 1) %>%
+  mutate(ee = sqrt(hit_rate_10 * (1 - hit_rate_10) / n_eval),
+         ic_inf = hit_rate_10 - 1.96 * ee,
+         ic_sup = hit_rate_10 + 1.96 * ee) %>%
+  arrange(desc(hit_rate_10))
+
+sin_umbral %>%
+  transmute(definicion,
+            `hit rate@10 (%)` = round(100 * hit_rate_10, 1),
+            `IC 95 % (%)` = paste0("[", round(100 * ic_inf, 1), ", ", round(100 * ic_sup, 1), "]"),
+            `precision@10 (%)` = round(100 * precision_10, 1))
+```
+
+Todos los intervalos se traslapan ampliamente: **con estos datos, las cuatro definiciones
+recomiendan igual de bien**. La diferencia entre la mejor y la peor
+(`r round(100 * (max(sin_umbral$hit_rate_10) - min(sin_umbral$hit_rate_10)), 1)` puntos) es
+menor que el error estándar de cada una (`r round(100 * mean(sin_umbral$ee), 1)` puntos).
+
+**¿Por qué el umbral de compradores en común no cambia nada?** Veamos cuántos pares de productos
+elimina cada umbral y cuántos compradores en común tienen los vecinos que de verdad usa el
+recomendador (los 10 más similares de cada producto):
+
+```{r efecto-umbral}
+S_log <- cos_matriz(hacer_matriz(entrena, "log", filas = compr_tr))
+con_similitud <- S_log > 0
+
+tibble(min_comunes = umbrales,
+       pares_con_similitud = sum(con_similitud) / 2,
+       pares_eliminados = sapply(umbrales, function(m) sum(con_similitud & comunes < m) / 2),
+       pct_eliminados = round(100 * pares_eliminados / pares_con_similitud, 1))
+
+# compradores en común entre cada producto y sus 10 vecinos más similares
+comunes_top10 <- sapply(seq_len(ncol(S_log)), function(j) {
+  vecinos <- order(S_log[, j], decreasing = TRUE)[1:10]
+  comunes[vecinos, j]
+})
+summary(as.vector(comunes_top10))
+mean(comunes_top10 < 5)   # proporción de vecinos top-10 con menos de 5 compradores en común
+```
+
+¿Los vecinos con poco respaldo son de productos poco vendidos? Comparamos el número de
+compradores de los productos según cuántos de sus 10 vecinos tienen menos de 5 compradores
+en común:
+
+```{r respaldo-por-producto}
+compradores_producto <- colSums(B_tr)
+tibble(vecinos_debiles = colSums(comunes_top10 < 5),
+       compradores = compradores_producto) %>%
+  mutate(grupo = cut(vecinos_debiles, c(-1, 0, 5, 10),
+                     labels = c("ninguno", "1 a 5", "6 a 10"))) %>%
+  group_by(`vecinos top-10 con < 5 compradores en común` = grupo) %>%
+  summarise(productos = n(), mediana_compradores = median(compradores))
+```
+
+**Lectura.** Los pares con poco respaldo **sí** llegan al top 10 de muchos productos (en
+`r round(100 * mean(comunes_top10 < 5))` % de los casos), pero casi siempre en productos que
+compran muy pocas personas: con tan pocos compradores, cualquier coincidencia da un coseno alto,
+el mismo fenómeno que vimos con los libros. Aun así, el umbral no cambia el hit rate, porque esos
+productos raros casi no aparecen en el historial de los compradores evaluados, y la puntuación de
+un comprador suma similitudes sobre todo su historial (22 productos en la mediana), lo que diluye
+cualquier par aislado.
+
+# Decisión
+
+**Definición elegida: `log` = log(1 + suma de cantidad).** Como las cuatro definiciones
+recomiendan igual de bien, el desempeño no decide y decide la **robustez**:
+
+* La `suma` y las `facturas` son las más expuestas a un comprador grande: en
+  `r sum(dominancia[, "suma"] > 0.5)` productos un solo comprador aporta más de la mitad de la
+  norma con la suma.
+* `log` reduce eso a `r sum(dominancia[, "log"] > 0.5)` productos y **conserva** la
+  información de intensidad (comprar 50 unidades sigue pesando más que comprar 1, pero no 50
+  veces más).
+* La `binaria` es la más robusta (`r sum(dominancia[, "binaria"] > 0.5)` productos), pero
+  descarta la intensidad por completo. `log` tiene además la precisión@10 más alta, aunque la
+  diferencia tampoco es significativa.
+
+**Umbral de compradores en común: 5.** En la evaluación por comprador no cambia nada, así que
+no tiene costo. Pero sí importa en la vista «producto» de la Fase 5, donde se muestran los
+vecinos de **un solo** producto: sin umbral, en los productos poco vendidos el top 10 se llena de
+pares respaldados por 1 a 4 compradores, que son coincidencias más que patrones. El análisis de sensibilidad completo del umbral es parte de la Fase 6.
+
+**Sesgos que hay que reconocer en el informe:**
+
+1. **No comprar no es rechazo.** Las celdas en 0 mezclan "no le interesa" con "no lo conoce".
+2. **Sesgo de popularidad.** Los productos muy vendidos (Ginkgo, Nistatina) coinciden con casi
+   todos, y la similitud tiende a sugerirlos siempre. La Fase 7 lo controla con la línea base.
+3. **Antigüedad del comprador.** Quien lleva más años acumula más productos y más volumen; las
+   definiciones de volumen premian la antigüedad, no la preferencia.
+4. **Presentaciones del mismo producto.** Un mismo medicamento en dos presentaciones son dos
+   códigos distintos, y saldrán muy similares entre sí. Eso es correcto, pero poco útil como
+   recomendación; lo revisaremos en la Fase 5.
+
+Esta validación es una guía para elegir; la evaluación formal, con la comparación contra los
+10 más vendidos, es la Fase 7.
+
+```{r guardar}
+definicion_elegida <- "log"
+umbral_elegido     <- 5
+user_item          <- matrices[[definicion_elegida]]
+saveRDS(list(user_item = user_item, definicion = definicion_elegida,
+             umbral = umbral_elegido, pares = pares),
+        "data/matriz_usuario_producto.rds")
+```

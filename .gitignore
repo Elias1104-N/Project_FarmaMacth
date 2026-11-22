@@ -1,0 +1,28 @@
+# RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# renv: los paquetes instalados se recrean con renv::restore()
+renv/library/
+renv/local/
+renv/staging/
+renv/sandbox/
+
+# Datos: no se suben (confidenciales o de Kaggle); ver README, sección «Datos y GitHub»
+archive.zip
+data/*
+!data/LEEME.txt
+
+# Archivos temporales e intermedios de knitr/rmarkdown
+*_files/
+*_cache/
+*.knit.md
+*.utf8.md
+informe/*.pdf.tmp
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini

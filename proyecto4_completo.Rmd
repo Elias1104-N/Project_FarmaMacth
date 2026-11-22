@@ -1,0 +1,123 @@
+---
+title: "Proyecto 4 · Sistema de recomendación para un marketplace farmacéutico"
+subtitle: "R Markdown reproducible con las fases 1 a 7"
+author: "Equipo · Estadística Industrial 2026-II"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+---
+
+```{r principal-setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Cada fase vive en su propio .Rmd (fase1_tutorial.Rmd, fase2_datos.Rmd, ...).
+# Este documento los ejecuta uno tras otro como documentos hijos. Antes de cada uno:
+#   1. quita su encabezado YAML (título, autor, formato), que solo sirve si se teje solo;
+#   2. baja un nivel sus títulos (# pasa a ##), para que queden dentro de "Fase N";
+#   3. antepone "fN-" a las etiquetas de sus bloques, para que dos fases con un bloque
+#      llamado igual (por ejemplo "setup" o "datos") no choquen ni se pisen las figuras.
+# Cada fase corre en su propio entorno, así sus objetos no se mezclan con los de otra.
+preparar_hijo <- function(archivo, prefijo) {
+  x <- readLines(archivo, encoding = "UTF-8", warn = FALSE)
+  if (x[1] == "---") {                                     # quitar el YAML
+    fin <- which(x == "---")[2]
+    x <- x[-(1:fin)]
+  }
+  en_bloque <- FALSE
+  for (i in seq_along(x)) {
+    if (grepl("^```", x[i])) {
+      if (!en_bloque && grepl("^```\\{r", x[i])) {
+        # ```{r etiqueta, opciones}  ->  ```{r fN-etiqueta, opciones}
+        x[i] <- sub("^```\\{r[ ,]*([A-Za-z0-9_.-]+)(\\s*[,}])", paste0("```{r ", prefijo, "-\\1\\2"),
+                    x[i], perl = TRUE)
+      }
+      en_bloque <- !en_bloque
+    } else if (!en_bloque && grepl("^#+ ", x[i])) {
+      x[i] <- paste0("#", x[i])                            # bajar un nivel los títulos
+    }
+  }
+  x
+}
+
+fase <- function(archivo, prefijo) {
+  texto <- preparar_hijo(archivo, prefijo)
+  salida <- knitr::knit_child(text = texto, envir = new.env(parent = globalenv()), quiet = TRUE)
+  gc()                                                     # liberar memoria entre fases
+  cat(salida, sep = "\n")
+}
+```
+
+# Cómo está organizado este documento {-}
+
+Este es el entregable reproducible del Proyecto 4. Ejecuta, en orden, las siete fases del
+enunciado. Cada fase también existe como documento independiente en la misma carpeta, por si
+se quiere revisar una sola.
+
+| Fase | Archivo | Qué produce | Qué guarda en `data/` |
+|---|---|---|---|
+| 1 | `fase1_tutorial.Rmd` | Tutorial de Ander Fernández reproducido con Book-Crossing (Kaggle), comentado línea a línea, con los dos errores corregidos | archivos descomprimidos de `archive.zip` |
+| 2 | `fase2_datos.Rmd` | Lectura en Latin-1, unión por `invoice`, resumen descriptivo | `datos_unidos.rds`, `catalogo.rds` |
+| 3 | `fase3_matriz.Rmd` | Cuatro definiciones de preferencia, dispersión, elección de log(1 + cantidad) | `matriz_usuario_producto.rds` |
+| 4 | `fase4_coseno.Rmd` | Función de coseno validada contra `lsa::cosine`, matriz 732 × 732 | `similitud_productos.rds` |
+| 5 | `fase5_item.Rmd` | `item_recommendation()` y casos con criterio farmacéutico | `recomendaciones_item.rds` |
+| 6 | `fase6_usuario.Rmd` | `user_recommendation()`, verificación de exclusión, sensibilidad a k y umbral | `recomendaciones_usuario.rds` |
+| 7 | `fase7_evaluacion.Rmd` | Partición temporal, hit rate@10 y precision@10 con IC frente a la línea base | (nada) |
+
+**Para generarlo:** abrir este archivo en RStudio desde la carpeta `proyecto4` y presionar
+**Knit**. La carpeta debe tener `archive.zip` (Kaggle) y `data/pro2.csv`, `data/cab.csv`. Tarda
+alrededor de 15 minutos (la Fase 6 sola toma unos 9) y necesita los paquetes `dplyr`, `tidyr`,
+`readr`, `ggplot2`, `cluster`, `lsa`, `rmarkdown` y `knitr`.
+
+```{r info-sesion, echo = FALSE}
+cat("Generado con", R.version.string, "el", format(Sys.time(), "%d/%m/%Y %H:%M"), "\n")
+```
+
+# Fase 1 · Reproducir el tutorial con Book-Crossing (Kaggle)
+
+```{r fase1, results = "asis", echo = FALSE}
+fase("fase1_tutorial.Rmd", "f1")
+```
+
+# Fase 2 · Cargar, limpiar y unir los datos de Procaps
+
+```{r fase2, results = "asis", echo = FALSE}
+fase("fase2_datos.Rmd", "f2")
+```
+
+# Fase 3 · Preferencia implícita y matriz usuario–producto
+
+```{r fase3, results = "asis", echo = FALSE}
+fase("fase3_matriz.Rmd", "f3")
+```
+
+# Fase 4 · Similitud de coseno
+
+```{r fase4, results = "asis", echo = FALSE}
+fase("fase4_coseno.Rmd", "f4")
+```
+
+# Fase 5 · Recomendador ítem–ítem
+
+```{r fase5, results = "asis", echo = FALSE}
+fase("fase5_item.Rmd", "f5")
+```
+
+# Fase 6 · Recomendador usuario–usuario
+
+```{r fase6, results = "asis", echo = FALSE}
+fase("fase6_usuario.Rmd", "f6")
+```
+
+# Fase 7 · Evaluación contra la línea base
+
+```{r fase7, results = "asis", echo = FALSE}
+fase("fase7_evaluacion.Rmd", "f7")
+```
+
+```{r info-final, echo = FALSE}
+sessionInfo()
+```

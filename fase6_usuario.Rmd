@@ -1,0 +1,337 @@
+---
+title: "Proyecto 4 · Fase 6: recomendador usuario–usuario"
+author: "Equipo · Estadística Industrial 2026-II"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+theme_set(theme_minimal())
+```
+
+# Datos de partida
+
+```{r datos}
+fase3    <- readRDS("data/matriz_usuario_producto.rds")   # matriz log(1 + cantidad)
+catalogo <- readRDS("data/catalogo.rds")
+datos    <- readRDS("data/datos_unidos.rds")
+
+X <- fase3$user_item                                       # 5.888 compradores × 732 productos
+nombre <- function(codigo) catalogo$description[match(codigo, catalogo$Material)]
+dim(X)
+```
+
+# Similitud entre compradores
+
+El recomendador usuario–usuario compara **filas**: dos compradores son parecidos si compran los
+mismos productos en proporciones parecidas. Usamos el mismo coseno validado en la Fase 4.
+
+Para que la consulta sea inmediata, normalizamos cada fila a norma 1 una sola vez. Así, el coseno
+entre un comprador y todos los demás es un solo producto matriz–vector:
+
+```{r normalizar}
+normas_filas <- sqrt(rowSums(X^2))
+Xn <- X / normas_filas                         # cada fila con norma 1
+
+similitud_usuarios <- function(colaborador) {
+  s <- as.vector(Xn %*% Xn[colaborador, ])     # coseno con los 5.888 compradores
+  names(s) <- rownames(X)
+  s[colaborador] <- NA                         # el propio comprador no es su vecino
+  s
+}
+
+# comprobación contra la definición directa del coseno, en un par
+cos_similarity <- function(A, B) sum(A * B) / (sqrt(sum(A^2)) * sqrt(sum(B^2)))
+u <- rownames(X)[1:2]
+c(rapida = similitud_usuarios(u[1])[u[2]], directa = cos_similarity(X[u[1], ], X[u[2], ]))
+```
+
+# Familias de producto
+
+En la Fase 5 vimos que un mismo producto aparece en varias presentaciones (Novamil 1, 2 y 3 de
+400 y 800 g; Dolofen de 20 y 60 tabletas). En la vista «comprador» no queremos llenar las 10
+recomendaciones con presentaciones de lo mismo. Definimos una **familia** aproximada con la
+primera palabra de la descripción, o las dos primeras cuando la primera es genérica
+(«VITAMINA E» y «VITAMINA C» son familias distintas):
+
+```{r familias}
+genericas <- c("VITAMINA", "TIRAS", "ACEITE", "OFERTA", "PROTEKTA")
+palabras  <- strsplit(catalogo$description, "\\s+")
+catalogo$familia <- sapply(palabras, function(p)
+  if (p[1] %in% genericas && length(p) > 1) paste(p[1], p[2]) else p[1])
+
+familia <- setNames(catalogo$familia, catalogo$Material)
+
+catalogo %>% count(familia, sort = TRUE) %>% head(8)
+```
+
+Es una regla simple, no una clasificación farmacéutica: sirve solo para dar variedad a la lista.
+
+# La función `user_recommendation()`
+
+```{r funcion}
+user_recommendation <- function(colaborador, k = 30, min_vecinos = 2, n = 10,
+                                una_por_familia = TRUE, matriz = X) {
+
+  if (!colaborador %in% rownames(matriz)) stop("Comprador no encontrado: ", colaborador)
+
+  # 1. los k compradores más parecidos
+  s <- similitud_usuarios(colaborador)
+  vecinos <- head(sort(s, decreasing = TRUE), k)
+  vecinos <- vecinos[vecinos > 0]
+
+  # 2. lo que el comprador YA compró (en toda su historia)
+  ya_comprados <- colnames(matriz)[matriz[colaborador, ] > 0]
+
+  # 3. para cada producto: cuántos vecinos lo compraron y su puntaje ponderado
+  Xv <- matriz[names(vecinos), , drop = FALSE]
+  candidatos <- tibble(
+    Material   = colnames(matriz),
+    n_vecinos  = colSums(Xv > 0),                                 # vecinos que lo compraron
+    puntaje    = as.vector(crossprod(Xv, vecinos)) / sum(vecinos)  # Σ sim·pref / Σ sim
+  ) %>%
+    filter(!Material %in% ya_comprados,          # EXCLUSIÓN de lo ya comprado
+           n_vecinos >= min_vecinos) %>%         # umbral mínimo de vecinos
+    arrange(desc(puntaje)) %>%
+    mutate(description = nombre(Material), familia = familia[Material])
+
+  # 4. variedad: como máximo un producto por familia
+  if (una_por_familia) candidatos <- candidatos %>% distinct(familia, .keep_all = TRUE)
+
+  candidatos %>%
+    head(n) %>%
+    mutate(explicacion = paste0(n_vecinos, " de los ", length(vecinos),
+                                " compradores con compras más parecidas a las suyas compraron este producto")) %>%
+    select(Material, description, n_vecinos, puntaje, explicacion)
+}
+```
+
+**Diferencias con el tutorial y por qué:**
+
+| Tutorial (libros) | Farmacia | Motivo |
+|---|---|---|
+| `apply()` fila por fila | Producto matriz–vector con filas normalizadas | La consulta es inmediata, necesaria para el prototipo |
+| `top_n(nearest_neighbors)` conserva empates | `head(sort(...), k)` | Exactamente k vecinos |
+| Promedio simple de la calificación | Promedio de la preferencia **ponderado por la similitud** | Un vecino muy parecido pesa más que uno poco parecido |
+| `count > threshold` | `n_vecinos >= min_vecinos` | Mismo umbral, nombre más claro |
+| Excluye los libros leídos | Excluye los productos comprados en **toda** su historia | Pregunta guía de la fase |
+| — | Un producto por familia | Evita listas llenas de presentaciones de lo mismo |
+
+# ¿Se excluyen de verdad los productos ya comprados?
+
+Tomamos un comprador concreto con un historial mediano (cerca de 22 productos, la mediana) y lo
+comprobamos de tres formas.
+
+```{r caso}
+n_productos <- rowSums(X > 0)
+caso <- names(n_productos)[which.min(abs(n_productos - 22))]
+caso
+
+historial <- datos %>%
+  filter(colaborador == caso) %>%
+  group_by(Material) %>%
+  summarise(description = first(description), unidades = sum(cantidad),
+            ultima_compra = max(fecha)) %>%
+  arrange(desc(unidades))
+nrow(historial)
+historial %>% head(10)
+
+recs <- user_recommendation(caso)
+recs %>% select(description, n_vecinos, explicacion)
+```
+
+```{r verificar-exclusion}
+# 1) contra la matriz
+c(recomendados_ya_comprados_segun_matriz = sum(X[caso, recs$Material] > 0))
+
+# 2) contra las facturas originales (independiente de la matriz)
+c(recomendados_ya_comprados_segun_facturas = sum(recs$Material %in% historial$Material))
+
+# 3) ¿qué pasaría sin el filtro? cuántos de los 10 mejores candidatos ya los tenía
+s <- similitud_usuarios(caso)
+vec <- head(sort(s, decreasing = TRUE), 30)
+sin_filtro <- names(sort(colSums(X[names(vec), ] * vec), decreasing = TRUE))[1:10]
+c(sin_filtro_ya_comprados = sum(sin_filtro %in% historial$Material))
+```
+
+Sin el filtro, buena parte de las "recomendaciones" serían productos que el comprador ya compra:
+sus vecinos se le parecen precisamente porque compran lo mismo que él. Con el filtro, ninguno de
+los 10 recomendados aparece en sus facturas.
+
+Comprobamos además la exclusión para **todos** los compradores:
+
+```{r verificar-todos}
+ya_comprado_total <- sum(sapply(rownames(X), function(cl) {
+  r <- user_recommendation(cl)
+  sum(X[cl, r$Material] > 0)
+}))
+ya_comprado_total   # debe ser 0
+```
+
+# Análisis de sensibilidad a k y al umbral
+
+¿Cuántos vecinos usar (k) y cuántos de ellos deben haber comprado un producto (umbral) para
+recomendarlo? Lo decidimos con la misma validación temporal de las fases anteriores: vecinos y
+recomendaciones calculados con las compras hasta el 31/12/2020, y acierto medido con las compras
+**nuevas** de 2021–2022.
+
+```{r particion}
+corte <- as.Date("2020-12-31")
+pares_log <- function(d) d %>% group_by(colaborador, Material) %>%
+  summarise(v = log1p(sum(cantidad)), .groups = "drop")
+entrena <- pares_log(filter(datos, fecha <= corte))
+prueba  <- pares_log(filter(datos, fecha >  corte))
+
+productos <- colnames(X)
+usu_tr <- sort(unique(entrena$colaborador))
+X_tr <- matrix(0, length(usu_tr), length(productos), dimnames = list(usu_tr, productos))
+X_tr[cbind(match(entrena$colaborador, usu_tr), match(entrena$Material, productos))] <- entrena$v
+
+eval_u <- intersect(usu_tr, unique(prueba$colaborador))
+nuevas <- prueba %>% filter(colaborador %in% eval_u) %>%
+  anti_join(entrena, by = c("colaborador", "Material"))
+eval_u <- intersect(eval_u, unique(nuevas$colaborador))
+verdad <- matrix(0, length(eval_u), length(productos), dimnames = list(eval_u, productos))
+verdad[cbind(match(nuevas$colaborador, eval_u), match(nuevas$Material, productos))] <- 1
+
+# similitud de cada comprador evaluado con todos los compradores de entrenamiento
+Xn_tr <- X_tr / sqrt(rowSums(X_tr^2))
+U <- Xn_tr[eval_u, ] %*% t(Xn_tr)
+U[cbind(seq_along(eval_u), match(eval_u, usu_tr))] <- 0      # sin sí mismo
+B_tr <- (X_tr > 0) * 1
+length(eval_u)
+```
+
+```{r evaluar-grilla}
+evaluar_k <- function(k, umbrales, n = 10) {
+  # pesos: la similitud de los k vecinos más parecidos de cada comprador, 0 para el resto
+  kth <- apply(U, 1, function(z) sort(z, decreasing = TRUE)[k])
+  W <- U * (U >= kth)
+  puntaje <- (W %*% X_tr) / rowSums(W)
+  conteo  <- (W > 0) %*% B_tr                                 # vecinos que compraron cada producto
+  puntaje[X_tr[eval_u, ] > 0] <- -Inf                         # excluye lo ya comprado
+  bind_rows(lapply(umbrales, function(m) {
+    p <- puntaje
+    p[conteo < m] <- -Inf                                     # umbral mínimo de vecinos
+    top <- t(apply(p, 1, function(z) order(z, decreasing = TRUE)[1:n]))
+    valido <- matrix(is.finite(p[cbind(rep(seq_along(eval_u), n), as.vector(top))]), ncol = n)
+    ac <- matrix(verdad[cbind(rep(seq_along(eval_u), n), as.vector(top))], ncol = n) * valido
+    tibble(k = k, min_vecinos = m,
+           hit_rate_10   = mean(rowSums(ac) > 0),
+           precision_10  = mean(rowSums(ac) / n),
+           cobertura     = mean(rowSums(valido) == n))        # compradores con 10 recomendaciones
+  }))
+}
+
+ks <- c(5, 10, 20, 30, 50, 100, 200)
+umbrales <- c(1, 2, 3, 5, 10)
+sensibilidad <- bind_rows(lapply(ks, evaluar_k, umbrales = umbrales))
+```
+
+**Hit rate@10 (%)** según k (filas) y umbral mínimo de vecinos (columnas):
+
+```{r tabla-hr}
+sensibilidad %>%
+  mutate(hit_rate_10 = round(100 * hit_rate_10, 1)) %>%
+  pivot_wider(id_cols = k, names_from = min_vecinos, values_from = hit_rate_10,
+              names_prefix = "umbral ")
+```
+
+**Cobertura (%)**: compradores que reciben las 10 recomendaciones completas:
+
+```{r tabla-cobertura}
+sensibilidad %>%
+  mutate(cobertura = round(100 * cobertura, 1)) %>%
+  pivot_wider(id_cols = k, names_from = min_vecinos, values_from = cobertura,
+              names_prefix = "umbral ")
+```
+
+```{r grafico-sensibilidad, fig.height = 4}
+sensibilidad %>%
+  ggplot(aes(k, 100 * hit_rate_10, color = factor(min_vecinos))) +
+  geom_line(linewidth = 1) + geom_point() +
+  scale_x_log10(breaks = ks) +
+  labs(x = "Número de vecinos k (escala log)", y = "hit rate@10 (%)",
+       color = "Umbral mínimo\nde vecinos",
+       title = "Sensibilidad del recomendador usuario–usuario")
+```
+
+```{r mejor}
+n_eval <- length(eval_u)
+mejor <- sensibilidad %>% slice_max(hit_rate_10, n = 1, with_ties = FALSE)
+ee <- sqrt(mejor$hit_rate_10 * (1 - mejor$hit_rate_10) / n_eval)
+mejor %>% mutate(ic_inf = hit_rate_10 - 1.96 * ee, ic_sup = hit_rate_10 + 1.96 * ee)
+
+# combinaciones cuyo hit rate cae dentro del IC 95 % de la mejor
+sensibilidad %>%
+  filter(hit_rate_10 >= mejor$hit_rate_10 - 1.96 * ee) %>%
+  arrange(desc(hit_rate_10)) %>%
+  mutate(across(c(hit_rate_10, precision_10, cobertura), ~ round(100 * .x, 1)))
+```
+
+## Lectura y elección
+
+```{r eleccion, echo = FALSE}
+k_elegido <- 50   # elegido a partir de la tabla de sensibilidad (ver texto)
+m_elegido <- 2
+```
+
+* **Con k pequeño** (5 o 10 vecinos) el recomendador depende de muy pocas personas: el acierto
+  baja y, si además se exige un umbral alto, muchos compradores no alcanzan 10 recomendaciones
+  (baja la cobertura).
+* **Con k muy grande** los vecinos dejan de ser parecidos: el promedio se acerca a "lo que compra
+  todo el mundo" y el recomendador se parece a la lista de los más vendidos.
+* **El umbral** filtra productos que solo compró un vecino. Con k pequeño un umbral alto vacía la
+  lista; con k grande casi no cambia nada, porque los productos que suben al top ya los compraron
+  muchos vecinos.
+
+La combinación con mayor acierto es k = `r mejor$k` y umbral = `r mejor$min_vecinos`, con un
+hit rate@10 de `r round(100 * mejor$hit_rate_10, 1)` % (IC 95 %:
+`r round(100 * (mejor$hit_rate_10 - 1.96 * ee), 1)` a `r round(100 * (mejor$hit_rate_10 + 1.96 * ee), 1)` %).
+Las combinaciones con k = 50 y umbral de 1 a 5, y casi todas las de k = 100 y 200, quedan dentro
+de ese intervalo, así que el acierto no las distingue. **Elegimos k = 50 y umbral = 2**:
+
+* **k = 50** es el menor número de vecinos que alcanza el acierto máximo. Con más vecinos el
+  acierto no mejora y los vecinos son cada vez menos parecidos, así que las recomendaciones se
+  acercan a "lo más vendido".
+* **Umbral = 2** da el mismo acierto y la misma cobertura (100 %) que el umbral 1, pero descarta
+  productos respaldados por un solo vecino. Es más robusto sin costo, y la explicación al usuario
+  ("al menos 2 de 50 compradores parecidos lo compraron") es más convincente.
+
+Estos son los valores por defecto que usará el prototipo, y la Fase 7 hará la comparación formal
+con la línea base.
+
+Nota: la evaluación se hizo **sin** la regla de una por familia, para medir el recomendador
+puro. Esa regla cambia el orden de la lista (da variedad) a cambio de dejar fuera algunas
+presentaciones; su efecto en el acierto se medirá en la Fase 7.
+
+# Resultados para el prototipo
+
+Precalculamos, para cada comprador, sus 10 recomendaciones con la explicación y su historial,
+que es lo que mostrará la vista «comprador».
+
+```{r exportar}
+recomendaciones_usuario <- bind_rows(lapply(rownames(X), function(cl)
+  user_recommendation(cl, k = k_elegido, min_vecinos = m_elegido) %>%
+    mutate(colaborador = cl, puesto = row_number(), .before = 1)))
+
+historial_usuario <- datos %>%
+  group_by(colaborador, Material) %>%
+  summarise(description = first(description), unidades = sum(cantidad),
+            facturas = n_distinct(invoice), ultima_compra = max(fecha), .groups = "drop")
+
+recomendaciones_usuario %>% count(colaborador) %>%
+  summarise(compradores = n(), con_10 = sum(n == 10), con_menos = sum(n < 10))
+
+saveRDS(list(recomendaciones = recomendaciones_usuario, historial = historial_usuario,
+             k = k_elegido, min_vecinos = m_elegido),
+        "data/recomendaciones_usuario.rds")
+```

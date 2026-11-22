@@ -1,0 +1,335 @@
+---
+title: "Proyecto 4 · Fase 7: evaluación contra una línea base"
+author: "Equipo · Estadística Industrial 2026-II"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+theme_set(theme_minimal())
+```
+
+**Pregunta:** ¿los recomendadores de las Fases 5 y 6 aciertan más que mostrar simplemente los
+10 productos más vendidos?
+
+# Diseño de la evaluación
+
+* **Partición temporal.** Todo se entrena con las compras hasta el **31/12/2020**: la matriz, las
+  similitudes, los vecinos y la lista de más vendidos. Se prueba con las compras de
+  **2021–2022**. Así el modelo nunca "ve el futuro", como pasaría en la realidad.
+* **Compradores evaluados:** los que compraron en ambos periodos.
+* **Acierto:** un producto recomendado es acierto si el comprador lo compró en 2021–2022 **y no lo
+  había comprado antes** (compra nueva). Recomendar algo que ya compra siempre no tiene mérito.
+* **Métricas**, con $R_u$ las 10 recomendaciones del comprador $u$ y $N_u$ sus compras nuevas:
+  * **hit rate@10** = proporción de compradores con al menos un acierto: $\frac{1}{|U|}\sum_u \mathbb{1}(|R_u \cap N_u| > 0)$
+  * **precision@10** = proporción promedio de aciertos en las 10: $\frac{1}{|U|}\sum_u \frac{|R_u \cap N_u|}{10}$
+* **Hiperparámetros** fijados en las fases anteriores (definición log, umbral 5 compradores en
+  común, α = 0,25, k = 50, mínimo 2 vecinos). No se ajustan aquí con los datos de prueba.
+
+```{r datos}
+datos    <- readRDS("data/datos_unidos.rds")
+catalogo <- readRDS("data/catalogo.rds")
+nombre   <- function(codigo) catalogo$description[match(codigo, catalogo$Material)]
+corte    <- as.Date("2020-12-31")
+
+pares <- function(d) d %>% group_by(colaborador, Material) %>%
+  summarise(v = log1p(sum(cantidad)), unidades = sum(cantidad), .groups = "drop")
+entrena <- pares(filter(datos, fecha <= corte))
+prueba  <- pares(filter(datos, fecha >  corte))
+
+productos <- sort(unique(datos$Material))
+usu_tr    <- sort(unique(entrena$colaborador))
+X_tr <- matrix(0, length(usu_tr), length(productos), dimnames = list(usu_tr, productos))
+X_tr[cbind(match(entrena$colaborador, usu_tr), match(entrena$Material, productos))] <- entrena$v
+B_tr <- (X_tr > 0) * 1
+
+eval_u <- intersect(usu_tr, unique(prueba$colaborador))
+nuevas <- prueba %>% filter(colaborador %in% eval_u) %>%
+  anti_join(entrena, by = c("colaborador", "Material"))
+verdad <- matrix(0, length(eval_u), length(productos), dimnames = list(eval_u, productos))
+verdad[cbind(match(nuevas$colaborador, eval_u), match(nuevas$Material, productos))] <- 1
+
+tibble(indicador = c("Compradores en entrenamiento", "Compradores en prueba",
+                     "Compradores en ambos (evaluados)",
+                     "Evaluados con al menos una compra nueva",
+                     "Compras nuevas (pares comprador-producto)",
+                     "Productos que solo existen en 2021-2022"),
+       valor = c(length(usu_tr), n_distinct(prueba$colaborador), length(eval_u),
+                 sum(rowSums(verdad) > 0), sum(verdad),
+                 sum(colSums(B_tr) == 0)))
+```
+
+Nota: hay compradores evaluados que en 2021–2022 solo repitieron productos. Para ellos ningún
+recomendador puede acertar, pero se incluyen, porque así lo pide la definición (todo comprador
+presente en ambos periodos). En la sección 4 repetimos el análisis solo con quienes sí hicieron
+compras nuevas. Los productos lanzados después de 2020 no pueden recomendarse con filtrado
+colaborativo (nadie los ha comprado en entrenamiento): es una limitación de estos métodos.
+
+# Los cinco recomendadores comparados
+
+Cada uno produce una matriz de 10 productos por comprador evaluado. En **todos** se excluyen los
+productos que el comprador ya compró en entrenamiento, también en la línea base: así la
+comparación es justa.
+
+```{r utilidades}
+top_n_matriz <- function(puntaje, n = 10) {          # índices de los n mejores de cada fila
+  t(apply(puntaje, 1, function(z) order(z, decreasing = TRUE)[1:n]))
+}
+ya_comprado <- B_tr[eval_u, ] > 0
+```
+
+**1. Línea base: los 10 más vendidos.** Los 10 productos con más unidades vendidas hasta 2020,
+saltando los que el comprador ya tiene (si ya tiene alguno, pasa al 11.º, etc.).
+
+```{r base}
+ventas_tr <- colSums(expm1(X_tr))                      # unidades vendidas hasta 2020
+nombre(names(sort(ventas_tr, decreasing = TRUE))[1:10])
+
+p_base <- matrix(ventas_tr, length(eval_u), length(productos), byrow = TRUE)
+p_base[ya_comprado] <- -Inf
+rec_base <- top_n_matriz(p_base)
+```
+
+**2 y 3. Ítem–ítem (Fase 5)**, con coseno puro y con la penalización de popularidad α = 0,25.
+La puntuación de un candidato es la suma de su similitud con los productos del historial,
+ponderada por la preferencia.
+
+```{r item}
+normas <- sqrt(colSums(X_tr^2))
+S <- crossprod(X_tr) / outer(normas, normas)
+S[is.nan(S)] <- 0
+S[crossprod(B_tr) < 5] <- 0                            # umbral de compradores en común
+diag(S) <- 0
+compradores_tr <- pmax(colSums(B_tr), 1)
+
+recomendar_item <- function(alpha) {
+  S_a <- S / matrix(compradores_tr^alpha, nrow(S), ncol(S), byrow = TRUE)
+  p <- X_tr[eval_u, ] %*% S_a
+  p[ya_comprado] <- -Inf
+  top_n_matriz(p)
+}
+rec_item0  <- recomendar_item(0)
+rec_item25 <- recomendar_item(0.25)
+```
+
+**4 y 5. Usuario–usuario (Fase 6)** con k = 50 vecinos y mínimo 2 vecinos, sin y con la regla de
+un producto por familia.
+
+```{r usuario}
+Xn <- X_tr / sqrt(rowSums(X_tr^2))
+U  <- Xn[eval_u, ] %*% t(Xn)
+U[cbind(seq_along(eval_u), match(eval_u, usu_tr))] <- 0          # sin sí mismo
+kth <- apply(U, 1, function(z) sort(z, decreasing = TRUE)[50])
+W   <- U * (U >= kth)
+p_usu <- (W %*% X_tr) / rowSums(W)
+p_usu[((W > 0) %*% B_tr) < 2] <- -Inf                           # mínimo 2 vecinos
+p_usu[ya_comprado] <- -Inf
+rec_usu <- top_n_matriz(p_usu)
+
+# regla de una por familia (Fase 6)
+genericas <- c("VITAMINA", "TIRAS", "ACEITE", "OFERTA", "PROTEKTA")
+palabras  <- strsplit(nombre(productos), "\\s+")
+familia   <- sapply(palabras, function(p)
+  if (p[1] %in% genericas && length(p) > 1) paste(p[1], p[2]) else p[1])
+
+rec_usu_fam <- t(apply(p_usu, 1, function(z) {
+  orden <- order(z, decreasing = TRUE)
+  orden <- orden[is.finite(z[orden])]
+  elegidos <- orden[!duplicated(familia[orden])]
+  c(elegidos, rep(NA, 10))[1:10]                     # NA si no hay 10 familias distintas
+}))
+```
+
+# Resultados
+
+```{r metricas}
+aciertos <- function(rec) {                            # matriz comprador × 10 con 1 = acierto
+  a <- matrix(verdad[cbind(rep(seq_along(eval_u), 10), as.vector(rec))], ncol = 10)
+  a[is.na(a)] <- 0
+  a
+}
+
+modelos <- list(
+  "Línea base: 10 más vendidos"   = rec_base,
+  "Ítem–ítem, coseno puro"        = rec_item0,
+  "Ítem–ítem, α = 0,25"           = rec_item25,
+  "Usuario–usuario, k = 50"       = rec_usu,
+  "Usuario–usuario, una por familia" = rec_usu_fam)
+
+por_usuario <- lapply(modelos, function(r) {
+  a <- aciertos(r)
+  tibble(colaborador = eval_u, hit = as.numeric(rowSums(a) > 0), precision = rowSums(a) / 10)
+})
+```
+
+## Intervalos de confianza
+
+* **hit rate@10** es una proporción: usamos el intervalo de **Wilson**, que se comporta bien
+  incluso con proporciones lejanas de 0,5.
+* **precision@10** es un promedio por comprador de una variable acotada y asimétrica: usamos
+  **bootstrap** (2.000 remuestreos de compradores, percentiles 2,5 y 97,5).
+
+```{r ic}
+wilson <- function(x, n, z = 1.96) {
+  p <- x / n
+  centro <- (p + z^2 / (2 * n)) / (1 + z^2 / n)
+  margen <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / (1 + z^2 / n)
+  c(centro - margen, centro + margen)
+}
+
+set.seed(2026)
+B <- 2000
+idx_boot <- replicate(B, sample.int(length(eval_u), replace = TRUE))
+
+resumen <- bind_rows(lapply(names(por_usuario), function(m) {
+  d <- por_usuario[[m]]
+  w <- wilson(sum(d$hit), nrow(d))
+  boot <- apply(idx_boot, 2, function(i) mean(d$precision[i]))
+  tibble(modelo = m,
+         hit_rate = mean(d$hit), hr_inf = w[1], hr_sup = w[2],
+         precision = mean(d$precision),
+         pr_inf = quantile(boot, 0.025), pr_sup = quantile(boot, 0.975))
+}))
+
+resumen %>%
+  transmute(modelo,
+            `hit rate@10 (%)` = round(100 * hit_rate, 1),
+            `IC 95 % Wilson` = sprintf("[%.1f, %.1f]", 100 * hr_inf, 100 * hr_sup),
+            `precision@10 (%)` = round(100 * precision, 2),
+            `IC 95 % bootstrap` = sprintf("[%.2f, %.2f]", 100 * pr_inf, 100 * pr_sup)) %>%
+  knitr::kable(align = "lrcrc")
+```
+
+```{r grafico, fig.height = 4.5}
+bind_rows(
+  resumen %>% transmute(modelo, metrica = "hit rate@10", valor = hit_rate, inf = hr_inf, sup = hr_sup),
+  resumen %>% transmute(modelo, metrica = "precision@10", valor = precision, inf = pr_inf, sup = pr_sup)
+) %>%
+  mutate(base = grepl("base", modelo),
+         modelo = factor(modelo, levels = rev(names(modelos)))) %>%
+  ggplot(aes(100 * valor, modelo, color = base)) +
+  geom_errorbarh(aes(xmin = 100 * inf, xmax = 100 * sup), height = 0.25) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ metrica, scales = "free_x") +
+  scale_color_manual(values = c(`TRUE` = "grey50", `FALSE` = "steelblue"), guide = "none") +
+  labs(x = "% (con IC 95 %)", y = NULL, title = "Recomendadores frente a la línea base")
+```
+
+## ¿La diferencia con la línea base es significativa?
+
+Que los intervalos no se traslapen ya es evidencia, pero la comparación correcta es **pareada**:
+los mismos compradores reciben las dos listas.
+
+* Para el **hit rate**: prueba de **McNemar**, que solo mira a los compradores en los que los dos
+  métodos difieren (uno acierta y el otro no).
+* Para la **precision**: diferencia promedio por comprador con IC **bootstrap pareado** y prueba
+  de **Wilcoxon** de rangos con signo.
+
+```{r pareadas}
+base <- por_usuario[["Línea base: 10 más vendidos"]]
+
+comparacion <- bind_rows(lapply(names(modelos)[-1], function(m) {
+  d <- por_usuario[[m]]
+  tabla <- table(factor(d$hit, 0:1), factor(base$hit, 0:1))
+  dif   <- d$precision - base$precision
+  boot  <- apply(idx_boot, 2, function(i) mean(dif[i]))
+  tibble(modelo = m,
+         `solo el modelo acierta` = tabla["1", "0"],
+         `solo la base acierta`   = tabla["0", "1"],
+         `dif. hit rate (pp)`     = round(100 * (mean(d$hit) - mean(base$hit)), 1),
+         `p McNemar`              = format.pval(mcnemar.test(tabla)$p.value, eps = 1e-10, digits = 3),
+         p_mcnemar                = mcnemar.test(tabla)$p.value,
+         `dif. precision (pp)`    = round(100 * mean(dif), 2),
+         `IC 95 % dif. precision` = sprintf("[%.2f, %.2f]", 100 * quantile(boot, 0.025),
+                                            100 * quantile(boot, 0.975)),
+         `p Wilcoxon`             = format.pval(wilcox.test(d$precision, base$precision,
+                                                            paired = TRUE)$p.value,
+                                                eps = 1e-10, digits = 3))
+}))
+knitr::kable(select(comparacion, -p_mcnemar))
+```
+
+# Solo compradores con compras nuevas
+
+Los compradores que no hicieron ninguna compra nueva tienen 0 aciertos con cualquier método.
+Quitarlos no cambia la comparación, pero muestra el acierto entre quienes sí tenían algo nuevo
+que descubrir:
+
+```{r solo-nuevas}
+con_nuevas <- rowSums(verdad) > 0
+bind_rows(lapply(names(por_usuario), function(m) {
+  d <- por_usuario[[m]][con_nuevas, ]
+  w <- wilson(sum(d$hit), nrow(d))
+  tibble(modelo = m, compradores = nrow(d),
+         `hit rate@10 (%)` = round(100 * mean(d$hit), 1),
+         `IC 95 %` = sprintf("[%.1f, %.1f]", 100 * w[1], 100 * w[2]),
+         `precision@10 (%)` = round(100 * mean(d$precision), 2))
+})) %>% knitr::kable()
+```
+
+# ¿Qué tan distintas son las recomendaciones de la línea base?
+
+Un recomendador podría acertar mucho solo por repetir los más vendidos. Medimos la **cobertura
+del catálogo** (cuántos productos distintos recomienda en total) y qué parte de sus
+recomendaciones son productos del top 10:
+
+```{r diversidad}
+top10_tr <- names(sort(ventas_tr, decreasing = TRUE))[1:10]
+bind_rows(lapply(names(modelos), function(m) {
+  r <- as.vector(modelos[[m]]); r <- r[!is.na(r)]
+  tibble(modelo = m,
+         `productos distintos recomendados` = n_distinct(r),
+         `% del catálogo` = round(100 * n_distinct(r) / length(productos), 1),
+         `% de recomendaciones del top 10` = round(100 * mean(productos[r] %in% top10_tr), 1))
+})) %>% knitr::kable()
+```
+
+# Conclusión
+
+```{r conclusion, echo = FALSE}
+r  <- setNames(resumen$hit_rate, resumen$modelo)
+pr <- setNames(resumen$precision, resumen$modelo)
+cmp <- setNames(split(comparacion, comparacion$modelo), comparacion$modelo)
+pv <- function(m) format(cmp[[m]]$p_mcnemar, scientific = TRUE, digits = 2)
+```
+
+1. **Todos los recomendadores superan a la línea base de forma estadísticamente significativa**
+   en las dos métricas. Los 10 más vendidos aciertan con al menos un producto nuevo en el
+   `r round(100 * r[1], 1)` % de los compradores; el usuario–usuario llega al
+   `r round(100 * r["Usuario–usuario, k = 50"], 1)` % (McNemar p = `r pv("Usuario–usuario, k = 50")`)
+   y el ítem–ítem con coseno puro al `r round(100 * r["Ítem–ítem, coseno puro"], 1)` %
+   (p = `r pv("Ítem–ítem, coseno puro")`). Ningún intervalo de la diferencia en precision@10
+   incluye el 0.
+2. **La mejora es modesta: 2 a 3 puntos.** La línea base es exigente en este mercado: pocos
+   productos concentran las ventas (Fase 2), así que "lo más vendido" ya acierta mucho. El valor
+   del recomendador no está solo en acertar algo más, sino en **acertar con productos
+   distintos**.
+3. **La diversidad sí cambia mucho.** La línea base recomienda solo 76 productos distintos, y casi
+   la mitad de sus recomendaciones son del top 10. El ítem–ítem con α = 0,25 recomienda
+   `r round(100 * 263 / length(productos))` % del catálogo con el mismo acierto que los demás
+   recomendadores; es decir, personaliza sin perder precisión.
+4. Las dos variantes "más amables con el usuario" (α = 0,25 en ítem–ítem y una por familia en
+   usuario–usuario) aciertan un punto menos que sus versiones puras, pero **siguen superando a la
+   línea base** (p = `r pv("Ítem–ítem, α = 0,25")` y p = `r pv("Usuario–usuario, una por familia")`)
+   y dan listas más variadas y con más sentido farmacéutico (Fase 5).
+
+**Decisión para el prototipo:**
+
+* **Vista «producto»:** ítem–ítem con α = 0,25. Es la que mejor se entiende ("quienes compran X
+  también compran Y") y la más diversa.
+* **Vista «comprador»:** usuario–usuario con k = 50, mínimo 2 vecinos y una por familia. Supera a
+  la línea base y evita listas llenas de presentaciones del mismo producto.
+
+**Limitaciones para el informe:** la mejora sobre la línea base es pequeña en términos absolutos;
+la evaluación mide compras, no satisfacción (un producto no comprado pudo ser una buena
+sugerencia); los 60 productos lanzados después de 2020 no pueden recomendarse con filtrado
+colaborativo, y un comprador sin historial no recibe recomendaciones personalizadas
+(arranque en frío), para quien la línea base sigue siendo la mejor opción.

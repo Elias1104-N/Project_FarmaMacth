@@ -1,0 +1,287 @@
+---
+title: "Proyecto 4 · Fase 5: recomendador ítem–ítem"
+author: "Equipo · Estadística Industrial 2026-II"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+theme_set(theme_minimal())
+```
+
+# Datos de partida
+
+```{r datos}
+fase3    <- readRDS("data/matriz_usuario_producto.rds")   # Fase 3: matriz log(1 + cantidad)
+fase4    <- readRDS("data/similitud_productos.rds")       # Fase 4: coseno 732 × 732
+catalogo <- readRDS("data/catalogo.rds")                  # Fase 2: un nombre por código
+
+X        <- fase3$user_item
+S        <- fase4$S_final      # coseno con umbral de 5 compradores en común y diagonal en 0
+comunes  <- fase4$comunes
+compradores_producto <- colSums(X > 0)
+
+nombre <- function(codigo) catalogo$description[match(codigo, catalogo$Material)]
+```
+
+# Buscar un producto por nombre
+
+El prototipo debe permitir buscar por nombre, no por código. Esta función normaliza el texto
+(mayúsculas, sin tildes) y devuelve los productos cuyo nombre contiene todas las palabras
+buscadas, ordenados por número de compradores.
+
+```{r buscar}
+normalizar <- function(x) toupper(iconv(x, to = "ASCII//TRANSLIT"))
+
+buscar_producto <- function(texto) {
+  palabras <- strsplit(normalizar(texto), "\\s+")[[1]]
+  coincide <- Reduce(`&`, lapply(palabras, function(p)
+    grepl(p, normalizar(catalogo$description), fixed = TRUE)))
+  catalogo[coincide, ] %>%
+    mutate(compradores = compradores_producto[Material]) %>%
+    arrange(desc(compradores)) %>%
+    select(Material, description, compradores)
+}
+
+buscar_producto("clotrimazol vaginal")
+```
+
+# La función `item_recommendation()`
+
+Dado un producto (código `Material` o texto de búsqueda), devuelve los `n` productos más
+similares con su descripción.
+
+```{r funcion}
+item_recommendation <- function(producto, n = 10, penalizacion = 0.25,
+                                sim = S, n_comunes = comunes) {
+
+  # acepta el código o un texto: si no es un código, toma el resultado más comprado
+  if (!producto %in% colnames(sim)) {
+    encontrados <- buscar_producto(producto)
+    if (nrow(encontrados) == 0) stop("No se encontró ningún producto con: ", producto)
+    producto <- encontrados$Material[1]
+  }
+
+  similitud <- sim[, producto]                    # coseno con todos los productos
+  # puntaje para ordenar: el coseno, penalizado por la popularidad del candidato
+  puntaje   <- similitud / compradores_producto[names(similitud)]^penalizacion
+
+  tibble(Material    = names(similitud),
+         description = nombre(Material),
+         similitud   = similitud,
+         compradores_en_comun = n_comunes[Material, producto],
+         puntaje     = puntaje) %>%
+    filter(Material != producto, similitud > 0) %>%   # ni el propio producto ni pares sin respaldo
+    slice_max(puntaje, n = n, with_ties = FALSE) %>%
+    mutate(producto_base = nombre(producto), .before = 1)
+}
+```
+
+**Detalles de la función:**
+
+* Usa la matriz de similitud **precalculada** en la Fase 4: no recalcula nada al consultar, así
+  que la respuesta es inmediata (importante para el prototipo).
+* La matriz ya trae el umbral de 5 compradores en común: los pares con menos respaldo tienen
+  similitud 0 y se descartan con `similitud > 0`.
+* `similitud` es siempre el coseno, que es lo que se reporta. `puntaje` solo se usa para
+  **ordenar**. Con `penalizacion = 0`, ordenar por puntaje es ordenar por coseno, igual que en el
+  tutorial. El parámetro se explica en la sección siguiente.
+
+# El problema de la popularidad
+
+En la Fase 4 vimos que el Ginkgo Biloba y la vitamina E aparecen como similares a casi todo.
+Con el coseno puro (`penalizacion = 0`), las recomendaciones de un antimicótico vaginal son:
+
+```{r ejemplo-puro}
+item_recommendation("300001536", n = 8, penalizacion = 0) %>%
+  select(description, similitud, compradores_en_comun)
+```
+
+Salvo las otras presentaciones de clotrimazol, la lista es Ginkgo, nistatina, vitamina E y
+jarabe para la tos: productos que compran casi todos los compradores, sin relación terapéutica
+con una crema vaginal. ¿Pasa en general? Contamos, para los 732 productos, qué parte de sus 5
+primeras recomendaciones son alguno de los 10 más vendidos:
+
+```{r popularidad}
+top10 <- names(sort(colSums(expm1(X)), decreasing = TRUE))[1:10]   # 10 más vendidos en unidades
+nombre(top10)
+
+cuota_top10 <- function(penalizacion) {
+  rec <- unlist(lapply(colnames(S), function(p)          # las 5 primeras de cada producto
+    item_recommendation(p, n = 5, penalizacion = penalizacion)$Material))
+  mean(rec %in% top10)
+}
+
+tibble(penalizacion = c(0, 0.25, 0.5)) %>%
+  rowwise() %>%
+  mutate(`% de recomendaciones que son top-10` = round(100 * cuota_top10(penalizacion), 1))
+```
+
+Con el coseno puro, una buena parte de las recomendaciones de **cualquier** producto son los
+mismos 10 productos. Eso es lo que haría una portada de "lo más vendido", que es justamente la
+línea base que el recomendador debe superar en la Fase 7.
+
+## Penalización por popularidad
+
+Para ordenar, dividimos el coseno por el número de compradores del candidato elevado a un
+exponente $\alpha$:
+
+$$\text{puntaje}(A \rightarrow B) = \frac{\cos(A, B)}{(\text{compradores de } B)^{\alpha}}$$
+
+* $\alpha = 0$: coseno puro (tutorial).
+* $\alpha$ pequeño (0,25): un producto 16 veces más popular necesita un coseno el doble de alto
+  para quedar al mismo nivel ($16^{0,25} = 2$).
+* $\alpha$ grande (0,5 o más): domina la rareza, y suben productos que compraron muy pocas personas.
+
+¿Cuesta precisión? Repetimos la validación temporal de la Fase 3 (entrenar hasta 2020, probar
+con las compras nuevas de 2021–2022) con distintos $\alpha$:
+
+```{r validacion-alpha}
+corte <- as.Date("2020-12-31")
+datos <- readRDS("data/datos_unidos.rds")
+
+pares_log <- function(d) d %>% group_by(colaborador, Material) %>%
+  summarise(v = log1p(sum(cantidad)), .groups = "drop")
+entrena <- pares_log(filter(datos, fecha <= corte))
+prueba  <- pares_log(filter(datos, fecha >  corte))
+
+productos <- colnames(X)
+usu_tr    <- sort(unique(entrena$colaborador))
+X_tr <- matrix(0, length(usu_tr), length(productos), dimnames = list(usu_tr, productos))
+X_tr[cbind(match(entrena$colaborador, usu_tr), match(entrena$Material, productos))] <- entrena$v
+
+eval_u <- intersect(usu_tr, unique(prueba$colaborador))
+nuevas <- prueba %>% filter(colaborador %in% eval_u) %>%
+  anti_join(entrena, by = c("colaborador", "Material"))
+eval_u <- intersect(eval_u, unique(nuevas$colaborador))
+verdad <- matrix(0, length(eval_u), length(productos), dimnames = list(eval_u, productos))
+verdad[cbind(match(nuevas$colaborador, eval_u), match(nuevas$Material, productos))] <- 1
+
+normas <- sqrt(colSums(X_tr^2))
+S_tr <- crossprod(X_tr) / outer(normas, normas)
+S_tr[is.nan(S_tr)] <- 0
+S_tr[crossprod((X_tr > 0) * 1) < fase3$umbral] <- 0
+diag(S_tr) <- 0
+n_tr <- pmax(colSums(X_tr > 0), 1)
+
+evaluar_alpha <- function(alpha, n = 10) {
+  S_a <- S_tr / matrix(n_tr^alpha, nrow(S_tr), ncol(S_tr), byrow = TRUE)  # penaliza al candidato
+  Xu  <- X_tr[eval_u, ]
+  p   <- Xu %*% S_a
+  p[Xu > 0] <- -Inf                                   # excluye lo ya comprado
+  top <- t(apply(p, 1, function(z) order(z, decreasing = TRUE)[1:n]))
+  ac  <- matrix(verdad[cbind(rep(seq_along(eval_u), n), as.vector(top))], ncol = n)
+  hr  <- mean(rowSums(ac) > 0)
+  ee  <- sqrt(hr * (1 - hr) / length(eval_u))
+  tibble(alpha = alpha,
+         `hit rate@10 (%)` = round(100 * hr, 1),
+         `IC 95 % (%)` = paste0("[", round(100 * (hr - 1.96 * ee), 1), ", ",
+                                round(100 * (hr + 1.96 * ee), 1), "]"),
+         `precision@10 (%)` = round(100 * mean(rowSums(ac) / n), 1))
+}
+
+bind_rows(lapply(c(0, 0.1, 0.25, 0.5), evaluar_alpha))
+```
+
+Con $\alpha = 0{,}25$ el acierto queda dentro del intervalo de confianza del coseno puro: la
+penalización **no cuesta precisión** de forma detectable. Con $\alpha = 0{,}5$ el acierto se
+desploma, porque el recomendador empieza a sugerir productos rarísimos. Elegimos
+**$\alpha = 0{,}25$** como valor por defecto: mantiene el acierto y, como se ve en los casos,
+mejora mucho el sentido farmacéutico. La Fase 7 lo evaluará formalmente frente a la línea base.
+
+# Análisis de casos
+
+Siete productos de categorías terapéuticas distintas, comparando el coseno puro
+($\alpha = 0$) con el ajustado ($\alpha = 0{,}25$):
+
+```{r casos}
+casos <- tribble(
+  ~categoria,                          ~Material,
+  "Antimicótico ginecológico",         "300001536",   # clotrimazol crema vaginal
+  "Suplemento prenatal",               "300004184",   # Gestavit DHA
+  "Oftalmológico (lágrima artificial)", "300000057",  # Lagrifresh
+  "Analgésico",                        "300000709",   # Dolofen Forte
+  "Pediátrico respiratorio",           "300000105",   # Klear Kids tos
+  "Diabetes (insumo)",                 "500000204",   # tiras GlucoQuick
+  "Nutrición infantil",                "500000298"    # Novamil Premium 2
+)
+
+comparar <- function(material, k = 5) {
+  a0  <- item_recommendation(material, n = k, penalizacion = 0)
+  a25 <- item_recommendation(material, n = k, penalizacion = 0.25)
+  tibble(puesto = 1:k,
+         `coseno puro (α = 0)` = paste0(substr(a0$description, 1, 38), " (", round(a0$similitud, 2), ")"),
+         `ajustado (α = 0,25)` = paste0(substr(a25$description, 1, 38), " (", round(a25$similitud, 2), ")"))
+}
+```
+
+```{r casos-tablas, results = "asis"}
+for (i in seq_len(nrow(casos))) {
+  cat("\n\n## ", casos$categoria[i], ": ", nombre(casos$Material[i]),
+      " (", compradores_producto[casos$Material[i]], " compradores)\n\n", sep = "")
+  print(knitr::kable(comparar(casos$Material[i])))
+}
+```
+
+## Tabla de casos analizados
+
+Entre paréntesis en las tablas anteriores está el coseno. La evaluación farmacéutica se refiere a
+las recomendaciones **ajustadas** ($\alpha = 0{,}25$):
+
+| Categoría | Producto | ¿Tienen sentido farmacéutico? |
+|---|---|---|
+| Antimicótico ginecológico | Clotrimazol crema vaginal | **Sí, pero repetitivo.** Los cuatro primeros son otras presentaciones de clotrimazol (vaginal y tópico): el mismo tratamiento. Con α = 0 aparecían Ginkgo, nistatina y vitamina E en los puestos 2, 4 y 5. El quinto (jarabe Klear Kids) no tiene relación terapéutica. |
+| Suplemento prenatal | Gestavit DHA | **Parcial.** Aparecen Gestavit Materno (misma línea prenatal), Pediavit Zinc y Pleniv: coherente con embarazo y crianza. Siguen la nistatina con óxido de zinc (crema para la pañalitis, razonable en este contexto) y la vitamina E, que es popularidad. |
+| Oftalmológico | Lagrifresh | **Sí en los tres primeros.** Tearsoft, Lagrigen y una oferta del mismo Lagrifresh: lágrimas artificiales. Con α = 0 el primero era el Ginkgo. Los puestos 4 y 5 (vitamina E, Gumivit) no tienen relación. |
+| Analgésico | Dolofen Forte | **Sí, con matiz.** Otras presentaciones de Dolofen y diclofenaco en aerosol: todos para el dolor. Las variantes aportan poco descubrimiento y el tapabocas del quinto puesto es popularidad. |
+| Pediátrico respiratorio | Klear Kids tos | **Sí.** Dolofen jarabe (fiebre), Klear tos menta, Pamox suspensión (antibiótico) y Fortzink jarabe: el botiquín del niño enfermo. Con α = 0 los puestos 2 a 5 eran Ginkgo, nistatina, clotrimazol y vitamina E. |
+| Diabetes | Tiras GlucoQuick | **Sí, el mejor caso.** Lancetas, glucómetro y otras presentaciones de tiras: los insumos que usa el mismo paciente. Con α = 0 los puestos 3 a 5 eran Nutrigel y tapabocas. |
+| Nutrición infantil | Novamil Premium 2 | **Sí, pero redundante.** Las cinco son otras presentaciones de Novamil (etapas 1, 2 y 3, de 400 y 800 g), igual con o sin penalización: la familia que acompaña el crecimiento del bebé. |
+
+**Conclusiones del análisis:**
+
+1. El coseno puro captura bien los **complementos fuertes** (tiras y lancetas) y las variantes,
+   pero en los demás casos lo tapa el sesgo de popularidad.
+2. Con la penalización, los primeros puestos pasan a ser del **mismo uso terapéutico** en los siete
+   casos; en algunos, los últimos puestos siguen siendo productos populares sin relación.
+3. Una limitación que queda: las **variantes del mismo producto** (Novamil, Dolofen, clotrimazol).
+   En la vista "producto" del prototipo esto puede ser útil ("también disponible en 800 g"), pero
+   en la vista "comprador" conviene no llenar la lista con presentaciones del mismo producto. Lo
+   tendremos en cuenta en la Fase 6.
+4. El recomendador **no sabe** de farmacología: si sugiere productos del mismo uso es porque los
+   compran los mismos compradores. No debe usarse para sugerir medicamentos con fórmula médica
+   sin la indicación de un profesional.
+
+# Resultados para el prototipo
+
+Precalculamos las 10 recomendaciones de cada uno de los 732 productos, con la frase que explicará
+cada una en lenguaje sencillo:
+
+```{r exportar}
+recomendaciones_item <- bind_rows(lapply(colnames(S), function(p)
+  item_recommendation(p, n = 10, penalizacion = 0.25) %>%
+    mutate(Material_base = p, puesto = row_number(), .before = 1))) %>%
+  mutate(explicacion = paste0(compradores_en_comun, " compradores de «",
+                              producto_base, "» también compraron este producto"))
+
+# productos con menos de 10 recomendaciones (pocos compradores en común con cualquier otro)
+recomendaciones_item %>% count(Material_base) %>%
+  summarise(filas = sum(n), productos_con_10 = sum(n == 10), productos_con_menos = sum(n < 10))
+c(productos_sin_recomendaciones = sum(!colnames(S) %in% recomendaciones_item$Material_base))
+head(recomendaciones_item %>% select(producto_base, puesto, description, similitud, explicacion), 5)
+
+saveRDS(recomendaciones_item, "data/recomendaciones_item.rds")
+```
+
+Los productos con menos de 10 recomendaciones, o sin ninguna, son productos que compraron muy
+pocas personas: no comparten 5 compradores con suficientes productos. En el prototipo, para
+ellos se mostrará el mensaje "aún no hay suficientes compras para recomendar" o, como respaldo,
+los productos más vendidos.

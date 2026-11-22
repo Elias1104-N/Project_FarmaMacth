@@ -1,0 +1,653 @@
+---
+title: "Proyecto 4 · Fase 1: reproducción del tutorial de Ander Fernández con Book-Crossing (Kaggle)"
+author: "Equipo · Estadística Industrial 2026-II"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)   # manipulación de tablas: filter, group_by, summarise, joins
+```
+
+Este documento reproduce el tutorial «Cómo programar un sistema de recomendación en R»
+de Ander Fernández con la versión de Book-Crossing publicada en Kaggle. Cada bloque de
+código está comentado línea a línea y, al final de cada sección, se explica **qué hace** y
+**qué supuesto hace sobre los datos**. Las diferencias con el tutorial original y los
+cambios están marcados así:
+
+* **Cambio:** ajuste necesario por usar los datos de Kaggle.
+* **Error:** fallo real del código, que mostramos con el original al lado del corregido
+  (hay dos: `recomendar()` e `item_recommendation()`).
+* **Nota de interpretación:** el código funciona, pero su resultado hay que leerlo con cuidado.
+
+# Lectura de los datos
+
+```{r lectura}
+unzip("archive.zip", exdir = "data")            # descomprime el zip de Kaggle en la carpeta data/
+
+# Cambio: el tutorial tomaba los archivos por posición, files[1], files[2], files[3], después
+# de list.files("data"). En nuestra carpeta data/ también están pro2.csv y cab.csv de la
+# farmacia, así que el orden alfabético ya no da Books, Ratings, Users. Los leemos por nombre.
+books   = read.csv("data/Books.csv",   sep = ";")   # libros: ISBN, Title, Author, Year, Publisher
+ratings = read.csv("data/Ratings.csv", sep = ";")   # calificaciones: User-ID, ISBN, Rating
+users   = read.csv("data/Users.csv",   sep = ";")   # usuarios: User-ID, Age
+```
+
+**¿Qué cambió al pasar del archivo original al de Kaggle?**
+
+| | Original (U. de Friburgo) | Kaggle (este proyecto) |
+|---|---|---|
+| Archivos | `BX-Books.csv`, `BX-Book-Ratings.csv`, `BX-Users.csv` | `Books.csv`, `Ratings.csv`, `Users.csv` |
+| Codificación | Latin-1 | UTF-8 |
+| Columnas de libros | `Book-Title`, `Book-Author`, `Year-Of-Publication`, `Publisher` y tres URL de carátula | `Title`, `Author`, `Year`, `Publisher` (sin URL de carátula) |
+| Columna de calificación | `Book-Rating` | `Rating` |
+| Usuarios | `User-ID`, `Location`, `Age` | `User-ID`, `Age` (sin `Location`) |
+
+* `read.csv()` convierte los guiones de los nombres en puntos, así que `User-ID` queda como
+  `User.ID`, que es el nombre que usa el resto del código.
+* El código usa `Author`, `Publisher` y `Rating`, que ya coinciden con Kaggle; con el
+  archivo original habría que renombrar `Book.Author` y `Book.Rating`.
+* Kaggle no trae las URL de carátula, así que la parte del tutorial que descarga las
+  imágenes con `readJPEG` no se puede reproducir. En el proyecto de la farmacia esa parte
+  la reemplazan las tarjetas del prototipo.
+* Verificamos que la lectura no se dañó con comillas dentro de los títulos: el número de
+  filas leídas debe ser el número de líneas del archivo menos el encabezado.
+
+```{r verificar-lectura}
+c(libros = nrow(books), calificaciones = nrow(ratings), usuarios = nrow(users))
+c(lineas_books = length(readLines("data/Books.csv", encoding = "UTF-8")) - 1)
+```
+
+# Exploración de los datos
+
+```{r exploracion}
+glimpse(ratings)   # 3 columnas: usuario (entero), ISBN (texto) y calificación de 0 a 10
+glimpse(books)
+glimpse(users)
+```
+
+## Categorías aleatorias
+
+Book-Crossing no trae género literario. Para tener una tercera variable de contenido, el
+tutorial **inventa** una categoría al azar. Es solo didáctico: como la categoría no tiene
+relación con el libro, cualquier similitud que dependa de ella es ruido.
+
+```{r categorias}
+set.seed(1234)                                   # semilla para que el sorteo sea reproducible
+categories = c("Action and Adventure", "Classic", "Detective and Mystery", "Fantasy")
+books$category = sample(categories, nrow(books), # a cada libro le asigna una categoría al azar
+                        replace = TRUE,          # con reemplazo: las categorías se repiten
+                        prob = c(0.25, 0.3, 0.25, 0.20))  # con estas probabilidades
+books$category = as.factor(books$category)       # la guarda como factor (variable categórica)
+
+rm(categories)
+table(books$category)
+```
+
+## Formato de los identificadores
+
+```{r formato-id}
+books$ISBN       = paste0("Isbn.", books$ISBN)        # antepone un prefijo de texto a cada ID
+users$User.ID    = paste0("User.", users$User.ID)     # para que R los trate como nombres y no
+ratings$ISBN     = paste0("Isbn.", ratings$ISBN)      # como números (así pueden ser nombres
+ratings$User.ID  = paste0("User.", ratings$User.ID)   # de filas y columnas de una matriz)
+```
+
+## Distribución de las calificaciones
+
+```{r grafico-ratings}
+library(ggplot2)
+
+ratings %>%
+  group_by(Rating) %>%                         # agrupa por valor de calificación
+  summarize(cases = n()) %>%                   # cuenta cuántas calificaciones hay de cada valor
+  ggplot(aes(Rating, cases)) + geom_col() +    # gráfico de barras
+  theme_minimal() + scale_x_continuous(breaks = 0:10)
+```
+
+La mayoría de las calificaciones son 0. En Book-Crossing un 0 es una **calificación
+implícita**: el usuario interactuó con el libro pero no lo puntuó. No significa "no me gustó".
+
+```{r quitar-ceros}
+ratings = ratings[ratings$Rating != 0, ]   # se quedan solo las calificaciones explícitas (1 a 10)
+```
+
+```{r grafico-sin-ceros}
+ratings %>%
+  group_by(Rating) %>%
+  summarize(cases = n()) %>%
+  ggplot(aes(Rating, cases)) + geom_col() +
+  theme_minimal() + scale_x_continuous(breaks = 0:10)
+```
+
+Sin los ceros, las calificaciones se concentran entre 5 y 10: los usuarios casi solo
+puntúan lo que les gustó.
+
+## Calificaciones por usuario
+
+```{r por-usuario}
+ratings_sum = ratings %>%
+  group_by(User.ID) %>%     # una fila por usuario
+  count()                   # número de calificaciones de cada usuario
+
+summary(ratings_sum$n)
+```
+
+Al menos el 75 % de los usuarios ha calificado 3 libros o menos. Con tan poca información
+no se puede encontrar a quién se parecen, así que el tutorial se queda con los usuarios que
+tienen **más de 4** calificaciones. Eso también reduce el cálculo.
+
+```{r filtrar-usuarios}
+user_index = ratings_sum$User.ID[ratings_sum$n > 4]       # usuarios con 5 o más calificaciones
+
+users   = users[users$User.ID %in% user_index, ]          # filtra las tres tablas a esos usuarios
+ratings = ratings[ratings$User.ID %in% user_index, ]
+books   = books[books$ISBN %in% ratings$ISBN, ]           # y a los libros que ellos calificaron
+
+rm(ratings_sum, user_index)
+
+c(usuarios = nrow(users), calificaciones = nrow(ratings), libros = nrow(books))
+```
+
+**Supuesto:** los usuarios con pocas calificaciones no aportan a la similitud. La
+consecuencia es que el sistema no sabe qué recomendarle a un usuario nuevo (el problema
+del "arranque en frío").
+
+Nota: hay calificaciones de ISBN que no están en la tabla de libros, así que el número de
+libros es menor que el de ISBN distintos en `ratings`.
+
+```{r isbn-sin-libro}
+c(isbn_en_ratings = n_distinct(ratings$ISBN),
+  isbn_con_ficha  = sum(unique(ratings$ISBN) %in% books$ISBN))
+```
+
+# Recomendador basado en contenido
+
+## Disimilitud de Gower
+
+Este recomendador compara libros por sus **características** (autor, editorial,
+categoría), no por quién los leyó. Como todas son categóricas, se usa la distancia de
+Gower de `cluster::daisy()`: para cada variable vale 0 si los dos libros coinciden y 1 si
+no, y luego se promedia (con pesos, si se dan).
+
+El tutorial intenta primero calcularla para todos los libros. **No lo ejecutamos**
+(`eval = FALSE`): con `r format(nrow(books), big.mark = ".", decimal.mark = ",")` libros la matriz tendría
+`r format(nrow(books), big.mark = ".", decimal.mark = ",")`² celdas, unos
+`r round(nrow(books)^2 * 8 / 1e9)` GB, y el equipo se queda sin memoria. Ese es justamente
+el punto que el tutorial quiere mostrar.
+
+```{r gower-todos, eval = FALSE}
+library(cluster)
+
+books_distance = books[, c("ISBN", "Author", "Publisher")]
+books_distance[, 1] <- as.factor(books_distance[, 1])     # daisy necesita factores, no texto
+books_distance[, 2] <- as.factor(books_distance[, 2])
+books_distance[, 3] <- as.factor(books_distance[, 3])
+
+dissimilarity = daisy(books_distance, metric = "gower")   # demasiado grande: no se ejecuta
+matrix(ncol = nrow(books), nrow = nrow(books))            # ilustra el tamaño de la matriz
+```
+
+**Cambio:** el original escribía el número de libros fijo (`115246`); aquí se usa
+`nrow(books)`, porque con Kaggle el número cambia.
+
+Por eso el tutorial se queda con **10.000 libros** y da pesos a las variables: el autor
+pesa 2, la editorial 0,5 y la categoría 1. Así dos libros se parecen más por tener el mismo
+autor que por tener la misma editorial.
+
+```{r gower-10000}
+library(cluster)
+
+book_feature = books[1:10000, c("Author", "Publisher", "category")]  # primeros 10.000 libros
+
+book_feature[, 1] <- as.factor(book_feature[, 1])
+book_feature[, 2] <- as.factor(book_feature[, 2])
+book_feature[, 3] <- as.factor(book_feature[, 3])
+
+dissimilarity = daisy(book_feature, metric = "gower",
+                      weights = c(2, 0.5, 1))      # pesos: autor, editorial, categoría
+dissimilarity = as.matrix(dissimilarity)          # objeto dist → matriz 10.000 × 10.000
+
+row.names(dissimilarity) <- books$ISBN[1:10000]   # filas y columnas con el ISBN de cada libro
+colnames(dissimilarity)  <- books$ISBN[1:10000]
+
+dissimilarity[15:20, 15:20]
+```
+
+**Nota de interpretación (texto del tutorial):** dice que se toman los libros "de los autores más
+comunes", pero `books[1:10000, ]` toma simplemente las primeras 10.000 filas del archivo.
+
+Con pesos 2, 0,5 y 1 (suma 3,5), los únicos valores posibles de disimilitud son:
+
+```{r valores-gower}
+w = c(autor = 2, editorial = 0.5, categoria = 1)
+combinaciones = expand.grid(autor = 0:1, editorial = 0:1, categoria = 0:1)  # 1 = no coincide
+combinaciones$disimilitud = round(as.matrix(combinaciones) %*% w / sum(w), 3)
+combinaciones[order(combinaciones$disimilitud), ]
+sort(unique(round(as.vector(dissimilarity), 3)))   # coinciden con los que aparecen en la matriz
+```
+
+De ahí sale el orden de las reglas del tutorial: primero mismo autor, editorial y categoría
+(0), luego mismo autor y categoría (0,14), luego solo mismo autor (0,43), etc.
+
+## Recomendaciones para un usuario
+
+```{r libros-usuario}
+user_id = "User.1167"
+
+user_books = ratings %>%
+  filter(User.ID == user_id & ISBN %in% books$ISBN[1:10000]) %>%  # libros de este usuario que
+  arrange(desc(Rating))                                           # están entre los 10.000
+
+head(user_books, 10)
+```
+
+La idea es recomendar libros parecidos a los que el usuario leyó, **ponderando** por su
+calificación: un libro parecido a uno que calificó con 10 vale más que uno parecido a uno
+que calificó con 5. La puntuación es `similitud × calificación`, con `similitud = 1 − disimilitud`.
+
+```{r recomendar}
+library(tidyr)
+
+books$ISBN = as.character(books$ISBN)
+selected_books = user_books[, c("ISBN", "Rating")]    # libros leídos y su calificación
+
+recomendar = function(selected_books, dissimilarity_matrix,
+                      books, n_recommendations = 5){
+
+  # columnas de la matriz que corresponden a los libros que leyó el usuario
+  selected_book_indexes = which(colnames(dissimilarity_matrix) %in% selected_books$ISBN)
+
+  # tabla ancha: una fila por libro candidato, una columna por libro leído
+  results = data.frame(dissimilarity_matrix[, selected_book_indexes],
+                       recommended_book = row.names(dissimilarity_matrix),
+                       stringsAsFactors = FALSE)
+
+  recomendaciones = results %>%
+    pivot_longer(cols = c(-"recommended_book"),        # a formato largo: un par
+                 names_to = "readed_book",             # (candidato, libro leído) por fila
+                 values_to = "dissimilarity") %>%
+    left_join(selected_books,                          # ERROR 1 corregido: calificación
+              by = c("readed_book" = "ISBN")) %>%      # del libro LEÍDO (ver abajo)
+    filter(recommended_book != readed_book) %>%        # un libro no se recomienda a sí mismo
+    filter(!(recommended_book %in% selected_books$ISBN)) %>%  # ni uno ya leído
+    filter(!is.na(Rating)) %>%
+    mutate(similarity = 1 - dissimilarity,             # similitud entre 0 y 1
+           weighted_score = similarity * Rating) %>%   # ponderada por la calificación
+    filter(weighted_score > 0) %>%
+    group_by(recommended_book) %>%
+    slice_max(weighted_score, n = 1, with_ties = FALSE) %>%  # mejor puntuación de cada candidato
+    ungroup() %>%
+    slice_max(weighted_score, n = n_recommendations,   # los N mejores
+              with_ties = FALSE) %>%
+    left_join(books, by = c("recommended_book" = "ISBN"))   # añade título, autor, etc.
+
+  return(recomendaciones)
+}
+
+recomendaciones = recomendar(selected_books, dissimilarity, books)
+recomendaciones %>% select(recommended_book, readed_book, similarity, Rating,
+                           weighted_score, Title, Author, Publisher, category)
+```
+
+## Error 1 · `recomendar()` recomendaba libros ya leídos
+
+Este es un **error real** del código: cambia el resultado. Original y corregido, lado a lado
+(solo cambia el centro de la tubería):
+
+::::: {style="display:grid; grid-template-columns:1fr 1fr; gap:1em;"}
+:::: {}
+**Original**
+
+```{r, eval = FALSE}
+pivot_longer(...) %>%
+  left_join(selected_books,
+    by = c("recommended_book" = "ISBN")) %>%
+  arrange(desc(dissimilarity)) %>%
+  filter(recommended_book != readed_book) %>%
+  filter(!is.na(Rating)) %>%
+  mutate(...) %>%
+  arrange(desc(weighted_score)) %>%
+  filter(weighted_score > 0) %>%
+  group_by(recommended_book) %>% slice(1) %>%
+  top_n(n_recommendations, weighted_score)
+```
+::::
+:::: {}
+**Corregido**
+
+```{r, eval = FALSE}
+pivot_longer(...) %>%
+  left_join(selected_books,
+    by = c("readed_book" = "ISBN")) %>%
+  filter(recommended_book != readed_book) %>%
+  filter(!(recommended_book %in%
+           selected_books$ISBN)) %>%
+  filter(!is.na(Rating)) %>%
+  mutate(...) %>%
+  filter(weighted_score > 0) %>%
+  group_by(recommended_book) %>%
+  slice_max(weighted_score, n = 1) %>%
+  ungroup() %>%
+  slice_max(weighted_score, n = n_recommendations)
+```
+::::
+:::::
+
+**Por qué cambió cada línea:**
+
+* **`by = c("readed_book" = "ISBN")`.** La calificación que pondera la similitud es la que el
+  usuario le dio al libro que **leyó**. El original la pegaba al libro **recomendado**. Como
+  después exige `!is.na(Rating)`, solo sobreviven los candidatos que tienen calificación, es
+  decir, los que el usuario **ya leyó**. Lo comprobamos ejecutando la versión original:
+
+```{r demostrar-error}
+results = data.frame(dissimilarity[, colnames(dissimilarity) %in% selected_books$ISBN],
+                     recommended_book = row.names(dissimilarity), stringsAsFactors = FALSE)
+version_original = results %>%
+  pivot_longer(cols = c(-"recommended_book"), names_to = "readed_book",
+               values_to = "dissimilarity") %>%
+  left_join(selected_books, by = c("recommended_book" = "ISBN")) %>%
+  filter(recommended_book != readed_book, !is.na(Rating))
+
+c(candidatos_original = n_distinct(version_original$recommended_book),
+  de_ellos_ya_leidos  = sum(unique(version_original$recommended_book) %in% selected_books$ISBN))
+```
+
+* **Filtro de libros ya leídos.** Con la unión corregida ya no hace falta para que el
+  resultado sea correcto en este caso, pero lo dejamos explícito: es la regla de negocio
+  ("no recomendar lo que ya tiene") y así no depende de un efecto secundario de la unión.
+* **`slice(1)` → `slice_max(weighted_score, n = 1)`.** `slice(1)` toma la primera fila de cada
+  grupo y solo es la mejor porque antes se ordenó. `slice_max` lo dice directamente.
+* **`top_n` → `ungroup()` + `slice_max(..., n = n_recommendations)`.** En el original, `top_n`
+  se aplicaba **dentro de cada grupo** (seguía agrupado por libro), así que no limitaba a N
+  recomendaciones. Además `top_n` devuelve filas de más cuando hay empates.
+* Los dos `arrange()` intermedios se quitaron porque `slice_max` ya ordena.
+
+**Supuestos de este recomendador:** que autor, editorial y categoría describen bien un libro
+(la categoría es aleatoria, así que aquí no aporta nada real), y que si a alguien le gustó un
+libro le gustarán los que se le parecen.
+
+# Recomendador colaborativo basado en ítems
+
+## Matriz usuario–producto
+
+Aquí ya no se usan las características del libro sino **quién lo calificó**. La base es la
+matriz usuario–producto: una fila por usuario, una columna por libro y la calificación en
+la celda.
+
+```{r user-item}
+rm(dissimilarity, book_feature, results)             # Cambio: libera ~3 GB de la parte de contenido,
+invisible(gc())                                      # que ya no se usa; así basta con menos RAM
+
+user_item = ratings %>%
+  top_n(10000) %>%                                   # ver nota abajo
+  pivot_wider(names_from = ISBN, values_from = Rating) %>%   # ISBN pasan a ser columnas
+  as.data.frame()
+
+row.names(user_item) = user_item$User.ID             # el usuario pasa a ser el nombre de fila
+user_item$User.ID = NULL
+
+user_item = as.matrix(user_item)                     # data.frame → matriz numérica
+
+dim(user_item)
+user_item[1:5, 1:5]
+```
+
+**Nota de interpretación sobre `top_n(10000)` (no es un error).** El código hace lo que
+dice y funciona, pero conviene saber qué produce. Sin decir columna, `top_n()` ordena por la
+última (`Rating`) y conserva todas las filas empatadas. Como hay más de 10.000
+calificaciones de 10, el resultado son **todas las calificaciones de 10**:
+
+```{r nota-topn}
+table(ratings %>% top_n(10000) %>% pull(Rating))
+```
+
+Es decir, la matriz solo tiene valores 10 o `NA`: en la práctica es una matriz
+**binaria** ("le encantó / no hay dato"). No lo corregimos: lo dejamos como en el tutorial
+porque reduce el tamaño y es una decisión de diseño válida, pero hay que tenerlo en cuenta
+al interpretar: en esta matriz, el coseno solo mide
+cuántos libros favoritos comparten dos usuarios.
+
+## Dispersión
+
+```{r dispersion}
+sum(is.na(user_item)) / (ncol(user_item) * nrow(user_item))   # proporción de celdas vacías
+```
+
+Casi todas las celdas están vacías: cada usuario calificó unos pocos libros entre miles.
+
+## Similitud de coseno
+
+$$\cos(A, B) = \frac{\sum_i A_i B_i}{\sqrt{\sum_i A_i^2}\,\sqrt{\sum_i B_i^2}}$$
+
+Mide el ángulo entre dos vectores: 1 si apuntan en la misma dirección, 0 si no comparten nada.
+
+```{r coseno}
+cos_similarity = function(A, B){
+  num = sum(A * B, na.rm = T)                                    # producto punto
+  den = sqrt(sum(A^2, na.rm = T)) * sqrt(sum(B^2, na.rm = T))    # producto de las normas
+  result = num / den
+  return(result)
+}
+```
+
+**Supuesto:** con `na.rm = TRUE` los `NA` cuentan como 0, es decir, "no calificó" se trata
+igual que "calificación cero" en el producto punto.
+
+## Función de recomendación por ítem
+
+En lugar de calcular la matriz libro–libro completa, la función calcula la similitud de un
+solo libro contra todos los demás.
+
+## Error 2 · `item_recommendation()` buscaba el libro en las filas
+
+Este también es un **error real**: con el código original la función no puede devolver
+recomendaciones válidas.
+
+::::: {style="display:grid; grid-template-columns:1fr 1fr; gap:1em;"}
+:::: {}
+**Original**
+
+```{r, eval = FALSE}
+user_index = which(
+  rownames(rating_matrix) == book_id)
+
+similarity = apply(rating_matrix, 2,
+  FUN = function(y) cos_similarity(
+    rating_matrix[user_index, ], y))
+
+tibble(ISBN = names(similarity),
+       similarity = similarity) %>%
+  filter(ISBN != book_id) %>%
+  top_n(n_recommendations, similarity) %>%
+  arrange(desc(similarity))
+```
+::::
+:::: {}
+**Corregido**
+
+```{r, eval = FALSE}
+book_index = which(
+  colnames(rating_matrix) == book_id)
+
+similarity = apply(rating_matrix, 2,
+  FUN = function(y) cos_similarity(
+    rating_matrix[, book_index], y))
+
+tibble(ISBN = names(similarity),
+       similarity = similarity) %>%
+  filter(ISBN != book_id) %>%
+  slice_max(similarity, n = n_recommendations,
+            with_ties = FALSE) %>%
+  arrange(desc(similarity))
+```
+::::
+:::::
+
+**Por qué cambió cada línea:**
+
+* **`rownames` → `colnames`.** En `user_item` las filas son usuarios y las columnas libros.
+  Buscar un ISBN entre los nombres de fila nunca lo encuentra y devuelve un índice vacío.
+* **`rating_matrix[user_index, ]` → `rating_matrix[, book_index]`.** Hay que comparar la
+  **columna** del libro elegido contra cada columna (`apply(..., 2, ...)` recorre columnas).
+  Con el índice vacío, el original compara un vector vacío: el numerador y el denominador
+  dan 0, todas las similitudes salen `NaN` (0/0), `top_n` las descarta y la función
+  devuelve una tabla **vacía**, sin dar error. Por eso es un fallo fácil de pasar por alto.
+* **El nombre `user_index` → `book_index`**, porque guarda la posición de un libro.
+* **`top_n` → `slice_max(..., with_ties = FALSE)`**, para devolver exactamente N.
+
+Lo comprobamos ejecutando la versión original con un libro que sí está en la matriz:
+
+```{r demostrar-error-2}
+item_recommendation_original = function(book_id, rating_matrix = user_item, n_recommendations = 5){
+  user_index = which(rownames(rating_matrix) == book_id)
+  similarity = apply(rating_matrix, 2, FUN = function(y)
+                       cos_similarity(rating_matrix[user_index, ], y))
+  tibble(ISBN = names(similarity), similarity = similarity) %>%
+    filter(ISBN != book_id) %>%
+    top_n(n_recommendations, similarity) %>%
+    arrange(desc(similarity))
+}
+
+libro = names(which.max(colSums(!is.na(user_item))))   # el libro con más calificaciones
+which(rownames(user_item) == libro)                    # índice vacío: no está en las filas
+original = item_recommendation_original(libro)
+sim_original = apply(user_item, 2, function(y)
+  cos_similarity(user_item[which(rownames(user_item) == libro), ], y))
+c(similitudes_calculadas = length(sim_original), de_ellas_NaN = sum(is.nan(sim_original)),
+  filas_devueltas = nrow(original))
+```
+
+La versión corregida:
+
+```{r item-recommendation}
+item_recommendation = function(book_id, rating_matrix = user_item, n_recommendations = 5){
+
+  book_index = which(colnames(rating_matrix) == book_id)        # posición del libro (columna)
+
+  similarity = apply(rating_matrix, 2, FUN = function(y)        # 2 = recorre columnas (libros)
+                       cos_similarity(rating_matrix[, book_index], y))
+
+  recommendations = tibble(ISBN = names(similarity),
+                           similarity = similarity) %>%
+    filter(ISBN != book_id) %>%                                 # quita el propio libro
+    slice_max(similarity, n = n_recommendations, with_ties = FALSE) %>%
+    arrange(desc(similarity))
+
+  return(recommendations)
+}
+```
+
+Además, el libro `Isbn.0446677451` del ejemplo no está en la matriz de Kaggle (esto no es
+un error del código, es que los datos cambiaron):
+
+```{r libro-ejemplo}
+"Isbn.0446677451" %in% colnames(user_item)
+```
+
+Usamos en su lugar el libro con más calificaciones de 10 en la matriz:
+
+```{r recom-item}
+books %>% filter(ISBN == libro) %>% select(ISBN, Title, Author)
+
+recom_cf_item = item_recommendation(libro)
+recom_cf_item %>% left_join(books %>% select(ISBN, Title, Author), by = "ISBN")
+```
+
+Las recomendaciones para *The Da Vinci Code* son casi todas de Robert B. Parker, con
+similitudes bajas. Como la matriz es binaria, el coseno entre dos libros es
+`compartidos / sqrt(n_A × n_B)`: un libro con muy pocos lectores puede salir arriba si uno
+solo de ellos también leyó el libro elegido. Veamos cuántos usuarios respaldan cada recomendación:
+
+```{r soporte-item}
+recom_cf_item %>%
+  mutate(lectores = colSums(!is.na(user_item[, ISBN, drop = FALSE])),
+         compartidos = colSums(!is.na(user_item[, ISBN, drop = FALSE]) &
+                                 !is.na(user_item[, libro])))
+```
+
+Es decir, las recomendaciones descansan en muy pocos usuarios en común. En la farmacia
+convendrá exigir un mínimo de compradores en común (el umbral de la Fase 6) antes de
+confiar en una similitud.
+
+# Recomendador colaborativo basado en usuarios
+
+Usa la misma matriz pero compara **filas**: encuentra los usuarios más parecidos al usuario
+elegido y le recomienda lo que ellos calificaron y él no ha leído.
+
+```{r user-recommendation}
+user_recommendation = function(user_id, user_item_matrix = user_item,
+                               ratings_matrix = ratings,
+                               n_recommendations = 5,
+                               threshold = 1,            # mínimo de vecinos que deben coincidir
+                               nearest_neighbors = 10){  # cuántos vecinos se usan
+
+  user_index = which(rownames(user_item_matrix) == user_id)   # fila del usuario
+
+  similarity = apply(user_item_matrix, 1, FUN = function(y)  # 1 = recorre filas (usuarios)
+                       cos_similarity(user_item_matrix[user_index, ], y))
+
+  similar_users = tibble(User.ID = names(similarity),
+                         similarity = similarity) %>%
+    filter(User.ID != user_id) %>%                    # quita al propio usuario
+    arrange(desc(similarity)) %>%
+    top_n(nearest_neighbors, similarity)              # los k más parecidos (con empates)
+
+  # todos los libros que el usuario ya calificó (en la tabla completa, no solo en la matriz)
+  readed_books_user = ratings_matrix$ISBN[ratings_matrix$User.ID == user_id]
+
+  recommendations = ratings_matrix %>%
+    filter(User.ID %in% similar_users$User.ID &      # libros calificados por los vecinos
+           !(ISBN %in% readed_books_user)) %>%        # que el usuario no ha leído
+    group_by(ISBN) %>%
+    summarise(count = n(),                            # cuántos vecinos lo calificaron
+              Rating = mean(Rating)) %>%              # calificación media de los vecinos
+    filter(count > threshold) %>%                     # al menos threshold + 1 vecinos
+    arrange(desc(Rating), desc(count)) %>%
+    head(n_recommendations)
+
+  return(list(vecinos = similar_users, recomendaciones = recommendations))
+}
+
+resultado = user_recommendation("User.99", n_recommendations = 20)
+nrow(resultado$vecinos)        # puede ser más de 10 por los empates de top_n
+head(resultado$vecinos)
+resultado$recomendaciones %>% left_join(books %>% select(ISBN, Title, Author), by = "ISBN")
+```
+
+**Cambio:** la función devuelve también los vecinos, para poder revisarlos.
+
+Comprobamos que **ninguna** recomendación es un libro que el usuario ya calificó:
+
+```{r verificar-exclusion}
+sum(resultado$recomendaciones$ISBN %in% ratings$ISBN[ratings$User.ID == "User.99"])
+```
+
+**Supuestos de este recomendador:** que usuarios que coinciden en sus favoritos tienen
+gustos parecidos en general, y que lo que los vecinos calificaron alto le gustará al
+usuario. Como la matriz es binaria (solo 10), la similitud ignora la intensidad; y como
+`top_n` conserva empates, el número de vecinos puede pasar de `nearest_neighbors`.
+
+# Resumen: qué hace cada recomendador y qué llevamos a la farmacia
+
+| Recomendador | Compara | Medida | En la farmacia |
+|---|---|---|---|
+| Contenido | Características del libro | Gower (`daisy`) con pesos | Opcional (bono): `formula medica`, IVA, palabras de `description` |
+| Ítem–ítem | Columnas de la matriz | Coseno | Productos que compran los mismos compradores |
+| Usuario–usuario | Filas de la matriz | Coseno | Compradores con historial parecido |
+
+Lecciones para la adaptación:
+
+1. Verificar siempre que la función busca el ID en la dimensión correcta (filas = usuarios,
+   columnas = productos).
+2. Excluir explícitamente lo ya comprado y comprobarlo con un caso concreto.
+3. Saber qué valores quedan en la matriz: aquí `top_n` la volvió binaria sin decirlo; en la
+   farmacia la definición de preferencia (Fase 3) se elige a propósito.
+4. Con 732 productos, la matriz producto–producto completa sí cabe en memoria (732² ≈ 0,5
+   millones de celdas), a diferencia de los libros.
